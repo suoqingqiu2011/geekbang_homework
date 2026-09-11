@@ -1,0 +1,21 @@
+# LLM Gateway — Docker Compose（H3，待评审定稿）
+# 用法：docker compose up -d
+# 数据卷 gateway-data 持久化 SQLite；配置目录挂载支持热更新
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    image: llm-gateway:1.0.0
+    container_name: llm-gateway
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - gateway-data:/srv/gateway/data
+      - ./config:/srv/gateway/config:ro
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

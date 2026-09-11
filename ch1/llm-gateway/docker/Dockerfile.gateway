@@ -1,0 +1,26 @@
+# LLM Gateway 镜像（H3 — 待评审启用）
+# 构建：docker build -f docker/Dockerfile.gateway -t llm-gateway:1.0.0 .
+# 运行：见 docker-compose.yml
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /srv/gateway
+
+# 依赖层缓存
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 应用代码
+COPY app ./app
+COPY cli ./cli
+COPY config ./config
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')" || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
