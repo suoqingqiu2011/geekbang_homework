@@ -8,8 +8,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"] = "user"
+    role: Literal["system", "user", "assistant", "tool"] = "user"
     content: str
+    # 预留：OpenAI 协议中 role="tool" 消息用于回传工具执行结果，
+    # 通过 tool_call_id 关联对应 assistants 消息里的 tool_calls。
+    tool_call_id: Optional[str] = None
 
 
 class JsonSchemaFormat(BaseModel):
