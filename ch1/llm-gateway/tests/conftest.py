@@ -21,6 +21,12 @@ from app.main import create_app  # noqa: E402
 
 from .mock_upstream import build_mock_app  # noqa: E402
 
+# 测试隔离：显式固定网关级 API keys 环境变量。
+# 注意：app.main 的 lifespan 启动时会执行 load_dotenv() 加载用户 .env，
+# 而 config_manager.get_api_keys() 优先读取环境变量 GATEWAY_API_KEYS。
+# 故此处须显式设置（而非 pop），使 load_dotenv(override=False) 不会用 .env 覆盖。
+os.environ["GATEWAY_API_KEYS"] = "sk-test"
+
 
 # ─────────────────────────────────────────────────────────────
 # Session-scoped mock upstream server
@@ -135,6 +141,123 @@ async def gateway(tmp_path, mock_url):
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         # 缩短重试策略，保证测试速度
+        app.state.ctx.retry.policy.max_attempts = 2
+        app.state.ctx.retry.policy.base_backoff = 0.01
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://gateway-test", timeout=20.0
+        ) as client:
+            yield {"client": client, "app": app, "ctx": app.state.ctx, "cfg_path": cfg_path}
+
+
+# ─────────────────────────────────────────────────────────────
+# Adapter 测试专用配置：覆盖 6 个 provider
+# ─────────────────────────────────────────────────────────────
+# 说明：openai / deepseek / kimi / qwen / ollama 共用 OpenAICompatAdapter
+#（Bearer 鉴权 + POST {base}/chat/completions），anthropic 用 AnthropicAdapter
+#（x-api-key 鉴权 + POST {base}/v1/messages）。
+# 每个 provider 的 model_aliases 指向 mock_upstream 中不同的行为模型，
+# 从而验证路由到正确 provider + 正确协议 + 正确的错误映射。
+def write_multi_provider_config(path: Path, mock_url: str) -> None:
+    providers = {
+        "openai": {
+            "api_base_url": mock_url + "/v1",
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 10.0,
+            "thinking_capability": 0.9,
+            "capacity": 10,
+            "timeout": 10.0,
+            "model_aliases": {"gpt-4o": "ok"},
+        },
+        "deepseek": {
+            "api_base_url": mock_url + "/v1",
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 1.0,
+            "thinking_capability": 0.8,
+            "capacity": 10,
+            "timeout": 10.0,
+            "model_aliases": {"deepseek-chat": "ok"},
+        },
+        "kimi": {
+            "api_base_url": mock_url + "/v1",
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 2.0,
+            "thinking_capability": 0.85,
+            "capacity": 10,
+            "timeout": 10.0,
+            "model_aliases": {"kimi-k2": "errauth"},
+        },
+        "qwen": {
+            "api_base_url": mock_url + "/v1",
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 1.5,
+            "thinking_capability": 0.75,
+            "capacity": 10,
+            "timeout": 10.0,
+            "model_aliases": {"qwen-max": "err500"},
+        },
+        "ollama": {
+            "api_base_url": mock_url + "/v1",
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 0.0,
+            "thinking_capability": 0.4,
+            "capacity": 3,
+            "timeout": 10.0,
+            "model_aliases": {"ollama-llama3": "timeout"},
+        },
+        "anthropic": {
+            "api_base_url": mock_url,
+            "api_key_env": "MOCK_KEY",
+            "cost_per_million_tokens": 15.0,
+            "thinking_capability": 0.95,
+            "capacity": 5,
+            "timeout": 10.0,
+            "model_aliases": {"claude-3-5-sonnet": "claude-3-5-sonnet"},
+        },
+    }
+    models = [
+        {"name": "gpt-4o", "provider": "openai", "routing_weight": 1.0},
+        {"name": "deepseek-chat", "provider": "deepseek", "routing_weight": 1.0},
+        {"name": "kimi-k2", "provider": "kimi", "routing_weight": 1.0},
+        {"name": "qwen-max", "provider": "qwen", "routing_weight": 1.0},
+        {"name": "ollama-llama3", "provider": "ollama", "routing_weight": 1.0},
+        {"name": "claude-3-5-sonnet", "provider": "anthropic", "routing_weight": 1.0},
+    ]
+    cfg = {
+        "server": {"host": "0.0.0.0", "port": 8000, "workers": 1, "log_level": "WARNING"},
+        "storage": {"db_path": str(path.parent / "multi_metrics.db"), "tracing_ttl": 3600.0},
+        "rate_limit": {
+            "refill_rate": 100.0,
+            "bucket_capacity": 500.0,
+            "per_model": 10000.0,
+            "per_endpoint": 10000.0,
+            "per_project": 10000.0,
+            "per_user": 10000.0,
+        },
+        "circuit_breaker": {"failure_threshold": 2, "recovery_timeout": 30.0, "half_open_max_calls": 2},
+        "http_pool": {
+            "max_connections": 100, "max_keepalive": 20,
+            "connect_timeout": 2.0, "read_timeout": 3.0,
+        },
+        "api_keys": ["sk-test"],
+        "providers": providers,
+        "available_models": models,
+    }
+    path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+
+
+@pytest_asyncio.fixture
+async def multi_gateway(tmp_path, mock_url):
+    """启动一个包含全部 6 个 provider（openai/deepseek/kimi/qwen/ollama/anthropic）
+    指向 mock 上游的网关，用于 adapter 协议测试。"""
+    cfg_path = tmp_path / "gateway_multi.yaml"
+    write_multi_provider_config(cfg_path, mock_url)
+    os.environ["GATEWAY_CONFIG_FILE"] = str(cfg_path)
+    os.environ["GATEWAY_DB_PATH"] = str(tmp_path / "multi_metrics.db")
+    os.environ["MOCK_KEY"] = "sk-test"
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
         app.state.ctx.retry.policy.max_attempts = 2
         app.state.ctx.retry.policy.base_backoff = 0.01
         async with httpx.AsyncClient(

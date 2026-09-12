@@ -55,7 +55,24 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-也可使用 Swagger UI 交互式测试：浏览器打开 `http://127.0.0.1:8000/docs`。
+流式输出（Server-Sent Events）：
+
+> 说明：Windows PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，必须使用 `curl.exe`
+> 才能支持 `-H`/`--data-binary` 等参数；流式场景还需加 `-N`（`--no-buffer`）关闭缓冲，
+> 才能看到逐行输出的效果。幂等写法：先把 JSON 写入临时文件再发送，避免引号转义问题。
+
+```powershell
+$json = '{"model":"deepseek-chat","messages":[{"role":"user","content":"数到5"}],"stream":true}'
+Set-Content -Path "$env:TEMP\req.json" -Value $json -Encoding UTF8 -NoNewline
+
+curl.exe -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" `
+  -H "Authorization: Bearer sk-gateway-dev" `
+  -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\req.json"
+```
+
+响应为多条 `data: {...}` 事件，末行 `data: [DONE]` 表示结束。也可直接使用 Swagger UI
+交互式测试：浏览器打开 `http://127.0.0.1:8000/docs`。
 
 ## 测试
 
