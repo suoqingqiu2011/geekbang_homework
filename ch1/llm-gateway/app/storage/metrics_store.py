@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS usage_metrics (
     prompt_tokens  INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
     total_tokens   INTEGER NOT NULL,
+    complete       INTEGER NOT NULL DEFAULT 1,   -- 是否完整(上游真实)用量
+    estimated      INTEGER NOT NULL DEFAULT 0,   -- 是否本地估算(如字符数)而非真实 token
     latency_ms     REAL NOT NULL,
     ttft_ms        REAL NOT NULL,
     cost_usd       REAL NOT NULL,
@@ -79,11 +81,12 @@ CREATE TABLE IF NOT EXISTS circuit_states (
 );
 
 CREATE TABLE IF NOT EXISTS prompt_templates (
-    template_id   TEXT PRIMARY KEY,
+    template_id   TEXT NOT NULL,
     name          TEXT NOT NULL,
     content       TEXT NOT NULL,
     version       INTEGER NOT NULL DEFAULT 1,
-    updated_at    REAL NOT NULL DEFAULT 0
+    updated_at    REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (template_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS daily_aggregates (
@@ -124,6 +127,8 @@ class MetricsStore:
         await self._db.execute("PRAGMA busy_timeout=5000;")
         await self._db.execute("PRAGMA synchronous=NORMAL;")
         await self._db.executescript(_TABLES)
+        await self._migrate_prompt_templates_if_needed()
+        await self._migrate_usage_columns_if_needed()
         await self._db.commit()
         logger.info("MetricsStore initialized: %s", self.db_path)
 
@@ -153,6 +158,8 @@ class MetricsStore:
         attempts: int = 1,
         fallback_used: bool = False,
         stream: bool = False,
+        complete: bool = True,
+        estimated: bool = False,
         user_id: str = "anonymous",
         project_id: str = "default",
     ) -> bool:
@@ -167,14 +174,15 @@ class MetricsStore:
             """
             INSERT OR IGNORE INTO usage_metrics (
                 billing_id, trace_id, provider, model, user_id, project_id, endpoint,
-                prompt_tokens, completion_tokens, total_tokens, latency_ms, ttft_ms,
-                cost_usd, attempts, fallback_used, stream, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'chat/completions', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                prompt_tokens, completion_tokens, total_tokens, complete, estimated,
+                latency_ms, ttft_ms, cost_usd, attempts, fallback_used, stream, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'chat/completions', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 billing_id, trace_id, provider, model, user_id, project_id,
-                prompt_tokens, completion_tokens, total, latency_ms, ttft_ms,
-                cost_usd, attempts, int(fallback_used), int(stream), time.time(),
+                prompt_tokens, completion_tokens, total, int(complete), int(estimated),
+                latency_ms, ttft_ms, cost_usd, attempts, int(fallback_used), int(stream),
+                time.time(),
             ),
         )
         await db.commit()
@@ -201,6 +209,21 @@ class MetricsStore:
             (day, provider, model, total_tokens, cost_usd, latency_ms),
         )
         await db.commit()
+
+    # ── 预算：按实际 token 用量核算累计花费 ────────────────────
+    async def query_spent_usd(self, project_id: str) -> float:
+        """查询某项目累计真实花费（用于预算路由的 spent_usd）。
+
+        估算行（estimated=1）落库时 cost_usd 已强制为 0，天然不计入累计；
+        因此累计值即"实际 token 用量对应的真实花费"。
+        """
+        db = self._require_db()
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS spent FROM usage_metrics WHERE project_id = ?",
+            (project_id,),
+        )
+        row = await cursor.fetchone()
+        return float(row["spent"])
 
     # ── Trace ─────────────────────────────────────────────────
     async def record_trace(self, trace: dict[str, Any]) -> None:
@@ -426,31 +449,101 @@ class MetricsStore:
         summary["errors"] = dict(row2)["c"] if row2 else 0
         return summary
 
-    # ── Prompt 模板（SPEC §4.5）───────────────────────────────
-    async def upsert_template(self, template_id: str, name: str, content: str) -> None:
+    # ── Prompt 模板（SPEC §4.5，按 template_id/version 保留历史）───────
+    async def _migrate_usage_columns_if_needed(self) -> None:
+        """旧库 usage_metrics 表补齐 complete/estimated 列（原有行按真实用量处理）。"""
         db = self._require_db()
-        await db.execute(
-            """
-            INSERT INTO prompt_templates (template_id, name, content, version, updated_at)
-            VALUES (?, ?, ?, 1, ?)
-            ON CONFLICT(template_id) DO UPDATE SET
-                content = excluded.content,
-                version = version + 1,
-                updated_at = excluded.updated_at
-            """,
-            (template_id, name, content, time.time()),
-        )
-        await db.commit()
+        info = await (await db.execute("PRAGMA table_info(usage_metrics)")).fetchall()
+        have = {row["name"] for row in info}
+        if "complete" not in have:
+            await db.execute(
+                "ALTER TABLE usage_metrics ADD COLUMN complete INTEGER NOT NULL DEFAULT 1"
+            )
+        if "estimated" not in have:
+            await db.execute(
+                "ALTER TABLE usage_metrics ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0"
+            )
 
-    async def get_template(self, template_id: str) -> dict[str, Any] | None:
+    async def _migrate_prompt_templates_if_needed(self) -> None:
+        """旧库中 prompt_templates 以 template_id 单主键存储（内容被覆盖）。
+
+        检测到非 (template_id, version) 联合主键时，重建表并将每个模板
+        现有最新内容迁移为 version=1，从而支持保留历史。
+        """
+        db = self._require_db()
+        info = await (await db.execute("PRAGMA table_info(prompt_templates)")).fetchall()
+        pk_cols = [row["name"] for row in info if row["pk"] > 0]
+        if pk_cols == ["template_id", "version"]:
+            return  # 已是联合主键的新结构，无需迁移
+        old = await (await db.execute("SELECT * FROM prompt_templates")).fetchall()
+        await db.execute("DROP TABLE prompt_templates")
+        await db.executescript(_TABLES)
+        for row in old:
+            await db.execute(
+                "INSERT OR IGNORE INTO prompt_templates (template_id, name, content, version, updated_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (row["template_id"], row["name"], row["content"], row["updated_at"]),
+            )
+
+    async def upsert_template(self, template_id: str, name: str, content: str) -> int:
+        """新增一个模板版本（自增 version），保留历史。返回新版本号。"""
         db = self._require_db()
         cursor = await db.execute(
-            "SELECT * FROM prompt_templates WHERE template_id = ?", (template_id,)
+            "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM prompt_templates WHERE template_id = ?",
+            (template_id,),
         )
+        next_version = int((await cursor.fetchone())["next"])
+        await db.execute(
+            "INSERT INTO prompt_templates (template_id, name, content, version, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (template_id, name, content, next_version, time.time()),
+        )
+        await db.commit()
+        return next_version
+
+    async def get_template(
+        self, template_id: str, version: int | None = None
+    ) -> dict[str, Any] | None:
+        """按 template_id 定位模板。
+
+        version=None → 返回最新版本；否则精确返回指定版本。无记录返回 None。
+        """
+        db = self._require_db()
+        if version is not None:
+            cursor = await db.execute(
+                "SELECT * FROM prompt_templates WHERE template_id = ? AND version = ?",
+                (template_id, version),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM prompt_templates WHERE template_id = ? ORDER BY version DESC LIMIT 1",
+                (template_id,),
+            )
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def delete_template(self, template_id: str) -> None:
+    async def list_template_versions(self, template_id: str) -> list[dict[str, Any]]:
+        """返回该模板的全部历史版本，按版本号升序。"""
         db = self._require_db()
-        await db.execute("DELETE FROM prompt_templates WHERE template_id = ?", (template_id,))
+        cursor = await db.execute(
+            "SELECT template_id, name, content, version, updated_at "
+            "FROM prompt_templates WHERE template_id = ? ORDER BY version ASC",
+            (template_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def delete_template(self, template_id: str, version: int | None = None) -> None:
+        """删除模板。version=None → 删除所有版本；否则仅删除指定版本。"""
+        db = self._require_db()
+        if version is not None:
+            await db.execute(
+                "DELETE FROM prompt_templates WHERE template_id = ? AND version = ?",
+                (template_id, version),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM prompt_templates WHERE template_id = ?",
+                (template_id,),
+            )
         await db.commit()

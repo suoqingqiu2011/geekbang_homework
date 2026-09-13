@@ -75,7 +75,7 @@ def write_test_config(path: Path, mock_url: str, *, rate: dict[str, float] | Non
             "thinking_capability": 0.7,
             "capacity": 10,
             "timeout": 10.0,
-            "model_aliases": {"ok": "ok", "broken": "broken", "badjson": "badjson"},
+            "model_aliases": {"ok": "ok", "broken": "broken", "badjson": "badjson", "nousage": "nousage", "slowstream": "slowstream", "rf400": "rf400"},
         },
         "timeout": {
             "api_base_url": mock_url + "/v1",
@@ -102,6 +102,9 @@ def write_test_config(path: Path, mock_url: str, *, rate: dict[str, float] | Non
         {"name": "failauth", "provider": "fail", "routing_weight": 1.0},
         {"name": "broken", "provider": "ok", "routing_weight": 1.0},
         {"name": "badjson", "provider": "ok", "routing_weight": 1.0},
+        {"name": "nousage", "provider": "ok", "routing_weight": 1.0},
+        {"name": "slowstream", "provider": "ok", "routing_weight": 1.0},
+        {"name": "rf400", "provider": "ok", "routing_weight": 1.0},
         {"name": "slow", "provider": "timeout", "routing_weight": 1.0},
         {"name": "claude-ok", "provider": "anthropic", "routing_weight": 1.0},
     ]
@@ -166,6 +169,7 @@ def write_multi_provider_config(path: Path, mock_url: str) -> None:
             "thinking_capability": 0.9,
             "capacity": 10,
             "timeout": 10.0,
+            "structured_output": "json_schema",
             "model_aliases": {"gpt-4o": "ok"},
         },
         "deepseek": {
@@ -211,7 +215,8 @@ def write_multi_provider_config(path: Path, mock_url: str) -> None:
             "thinking_capability": 0.95,
             "capacity": 5,
             "timeout": 10.0,
-            "model_aliases": {"claude-3-5-sonnet": "claude-3-5-sonnet"},
+            "structured_output": "none",
+            "model_aliases": {"claude-3-5-sonnet": "claude-3-5-sonnet", "claude-nousage": "claude-nousage", "claude-json": "claude-json"},
         },
     }
     models = [
@@ -221,6 +226,8 @@ def write_multi_provider_config(path: Path, mock_url: str) -> None:
         {"name": "qwen-max", "provider": "qwen", "routing_weight": 1.0},
         {"name": "ollama-llama3", "provider": "ollama", "routing_weight": 1.0},
         {"name": "claude-3-5-sonnet", "provider": "anthropic", "routing_weight": 1.0},
+        {"name": "claude-nousage", "provider": "anthropic", "routing_weight": 1.0},
+        {"name": "claude-json", "provider": "anthropic", "routing_weight": 1.0},
     ]
     cfg = {
         "server": {"host": "0.0.0.0", "port": 8000, "workers": 1, "log_level": "WARNING"},

@@ -244,6 +244,25 @@ async def test_budget_exhausted(gateway):
 
 
 # ─────────────────────────────────────────────────────────────
+# ★ 缺陷C 回归：调用后按实际 token 用量核算，超预算记录观测
+# ─────────────────────────────────────────────────────────────
+async def test_budget_exceeded_recorded_in_trace(gateway):
+    """预检通过（est=10t×$3/M=$3e-5 ≤ 预算$4e-5），但上游实际返回 20 token
+    （实际 $6e-5 > 预算）→ 请求成功但 trace 记录 budget_exceeded 供审计。"""
+    ctx = gateway["ctx"]
+    body = _req(trace_id="trace-over-budget", budget_usd=4e-5, max_tokens=10)
+    r = await gateway["client"].post("/v1/chat/completions", json=body, headers=_headers())
+    assert r.status_code == 200  # 内容已生成，不因超支而失败
+    row = await (
+        await ctx.store._require_db().execute(
+            "SELECT payload FROM traces WHERE trace_id = ?", ("trace-over-budget",)
+        )
+    ).fetchone()
+    assert row is not None
+    assert json.loads(row["payload"])["budget_exceeded"] is True
+
+
+# ─────────────────────────────────────────────────────────────
 # 计费恰好一次 + 限流
 # ─────────────────────────────────────────────────────────────
 async def test_billing_idempotent_per_trace(gateway):
@@ -261,18 +280,25 @@ async def test_billing_idempotent_per_trace(gateway):
     assert row["c"] == 1  # 恰好一次
 
 
-async def test_rate_limit_429(tmp_path, mock_url):
+async def test_rate_limit_429(monkeypatch, tmp_path, mock_url):
     """低 per-model 限额 → 429 + 错误结构（独立网关实例）。"""
     import os
 
     from app.main import create_app
 
     cfg_path = tmp_path / "gateway_rl.yaml"
-    # 速率 1/s + 容量 1：第一个请求通过，后续请求 429
-    write_test_config(cfg_path, mock_url, model_limit=1.0, bucket_capacity=1.0)
-    os.environ["GATEWAY_CONFIG_FILE"] = str(cfg_path)
-    os.environ["GATEWAY_DB_PATH"] = str(tmp_path / "rl_metrics.db")
-    os.environ["MOCK_KEY"] = "sk-test"
+    # 低 per-model 限额：容量 1、refill 0.01/s（补满 1 令牌需 100s）→
+    # 连续请求间即使出现秒级停顿也不会补满令牌，保证 #2/#3 稳定 429。
+    write_test_config(cfg_path, mock_url, model_limit=0.01, bucket_capacity=1.0)
+    monkeypatch.setenv("GATEWAY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("GATEWAY_DB_PATH", str(tmp_path / "rl_metrics.db"))
+    monkeypatch.setenv("MOCK_KEY", "sk-test")
+    # 显式钉住模型限流速率：项目 .env 的 GATEWAY_RATE_MODEL=10 会以
+    # env > .env > YAML 的优先级覆盖 YAML 低限额（与 GATEWAY_API_KEYS
+    # 需显式设置同理）；load_dotenv(override=False) 不会覆盖已设 env。
+    # 用 monkeypatch 而非直接写 os.environ：测试结束自动还原，避免泄漏到
+    # 后续通过 create_app() 创建的网关（否则会导致其他多请求用例被限成 429）。
+    monkeypatch.setenv("GATEWAY_RATE_MODEL", "0.01")
 
     app = create_app()
     transport = __import__("httpx").ASGITransport(app=app)

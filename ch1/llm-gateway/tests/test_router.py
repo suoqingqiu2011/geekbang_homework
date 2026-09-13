@@ -71,6 +71,38 @@ async def test_budget_exhausted():
         )
 
 
+# ─────────────────────────────────────────────────────────────
+# ★ 缺陷C 回归：预算按候选最大可能成本核算，而非仅 1 token 最小成本
+# ─────────────────────────────────────────────────────────────
+async def test_budget_filters_pricey_candidate_keeps_cheap():
+    """预算覆盖便宜候选的预估最大成本(2048t)，但不够贵候选 → 只保留便宜候选。"""
+    router = Router(CircuitBreakerManager())
+    cands = await router.route(
+        None, _models(), _providers(), budget_usd=0.003, spent_usd=0.0
+    )
+    # cheap est=2048/1e6*1.0=0.002048 ≤ 0.003；pricey est=2048/1e6*10=0.02048 > 0.003
+    assert [c.model_name for c in cands] == ["cheap-a"]
+
+
+async def test_budget_max_tokens_reduces_est_cost():
+    """指定 max_tokens 后按实际预估上限核算：max_tokens=100 时预算 0.0005 仍够 cheap。"""
+    router = Router(CircuitBreakerManager())
+    cands = await router.route(
+        None, _models(), _providers(), budget_usd=0.0005, spent_usd=0.0, max_tokens=100
+    )
+    # cheap est=100/1e6*1.0=0.0001 ≤ 0.0005；pricey est=100/1e6*10=0.001 > 0.0005
+    assert [c.model_name for c in cands] == ["cheap-a"]
+
+
+async def test_budget_spent_usd_filters_all_when_exhausted():
+    """累计花费 spent_usd 计入核算：预算被历史花费占满后无候选可留 → BudgetExhaustedError。"""
+    router = Router(CircuitBreakerManager())
+    with pytest.raises(BudgetExhaustedError):
+        await router.route(
+            None, _models(), _providers(), budget_usd=0.003, spent_usd=0.0029
+        )
+
+
 async def test_circuit_filter(tmp_path):
     from app.storage.metrics_store import MetricsStore
 

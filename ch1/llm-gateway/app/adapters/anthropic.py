@@ -43,11 +43,17 @@ class AnthropicAdapter(BaseAdapter):
                 rest.append({"role": m["role"], "content": str(m.get("content", ""))})
         return rest, ("\n\n".join(system_parts) or None)
 
-    def _raise_for_status(self, resp: httpx.Response) -> None:
+    async def _raise_for_status(self, resp: httpx.Response) -> None:
         status = resp.status_code
         if 200 <= status < 300:
             return
         body = ""
+        try:
+            # 流式响应须先 aread 才能访问 .json()/.text（否则抛 ResponseNotRead，
+            # 错误体被吞掉且 4xx 状态码无法正确映射；httpx<0.28 的 read() 为同步方法）
+            await resp.aread()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             data = resp.json()
             body = str(data.get("error", data))
@@ -126,7 +132,7 @@ class AnthropicAdapter(BaseAdapter):
         except httpx.HTTPError as exc:
             raise UpstreamError(f"Upstream network error ({self.provider.name}): {exc}") from exc
 
-        self._raise_for_status(resp)
+        await self._raise_for_status(resp)
         data = resp.json()
         latency_ms = (time.monotonic() - t0) * 1000.0
 
@@ -138,6 +144,8 @@ class AnthropicAdapter(BaseAdapter):
         usage = Usage(
             prompt_tokens=int(usage_raw.get("input_tokens", 0)),
             completion_tokens=int(usage_raw.get("output_tokens", 0)),
+            complete=bool(usage_raw),
+            estimated=not usage_raw,
         )
         stop_map = {"end_turn": "stop", "max_tokens": "length", "stop_sequence": "stop"}
         return AdapterResult(
@@ -169,11 +177,13 @@ class AnthropicAdapter(BaseAdapter):
         prompt_tokens = 0
         completion_tokens = 0
         stop_reason: Optional[str] = None
+        usage_seen = False  # message_delta 是否携带真实 output_tokens（估算/完整标记）
+
         completed = False
 
         try:
             async with client.stream("POST", self._endpoint, json=body, headers=await self._headers(trace_id)) as resp:
-                self._raise_for_status(resp)
+                await self._raise_for_status(resp)
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -198,7 +208,9 @@ class AnthropicAdapter(BaseAdapter):
                     elif etype == "message_delta":
                         stop_reason = (event.get("delta") or {}).get("stop_reason")
                         usage_raw = event.get("usage") or {}
-                        completion_tokens = int(usage_raw.get("output_tokens", completion_tokens))
+                        if usage_raw:
+                            usage_seen = True
+                            completion_tokens = int(usage_raw.get("output_tokens", completion_tokens))
                     elif etype == "error":
                         raise UpstreamError(f"Anthropic stream error: {event.get('error')}")
             completed = True
@@ -212,7 +224,8 @@ class AnthropicAdapter(BaseAdapter):
                     yield StreamEvent(
                         delta="",
                         finish_reason=stop_reason,
-                        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+                        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                                    complete=usage_seen, estimated=not usage_seen),
                         ttft_ms=ttft,
                     )
                 except GeneratorExit:

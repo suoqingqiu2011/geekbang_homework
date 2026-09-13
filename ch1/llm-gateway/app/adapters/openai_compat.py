@@ -31,11 +31,17 @@ class OpenAICompatAdapter(BaseAdapter):
         self._endpoint = provider.api_base_url.rstrip("/") + "/chat/completions"
 
     # ── 上游错误映射 ─────────────────────────────────────────
-    def _raise_for_status(self, resp: httpx.Response) -> None:
+    async def _raise_for_status(self, resp: httpx.Response) -> None:
         status = resp.status_code
         if 200 <= status < 300:
             return
         body = ""
+        try:
+            # 流式响应须先 aread 才能访问 .json()/.text（否则抛 ResponseNotRead，
+            # 错误体被吞掉且 4xx 状态码无法正确映射；httpx<0.28 的 read() 为同步方法）
+            await resp.aread()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             data = resp.json()
             body = str(data.get("error", data))
@@ -104,15 +110,18 @@ class OpenAICompatAdapter(BaseAdapter):
         )
         t0 = time.monotonic()
         try:
+            # 与流式/Anthropic 一致：非流式同样在请求头透传 trace_id，保证全链路追踪对称
+            headers = await self._headers()
+            headers.update(self._trace_headers(trace_id))
             resp = await client.post(
-                self._endpoint, json=body, headers=await self._headers(),
+                self._endpoint, json=body, headers=headers,
             )
         except httpx.TimeoutException as exc:
             raise UpstreamTimeoutError(f"Upstream timeout ({self.provider.name}): {exc}") from exc
         except httpx.HTTPError as exc:
             raise UpstreamError(f"Upstream network error ({self.provider.name}): {exc}") from exc
 
-        self._raise_for_status(resp)
+        await self._raise_for_status(resp)
         data = resp.json()
         latency_ms = (time.monotonic() - t0) * 1000.0
 
@@ -127,6 +136,8 @@ class OpenAICompatAdapter(BaseAdapter):
         usage = Usage(
             prompt_tokens=int(usage_raw.get("prompt_tokens", 0)),
             completion_tokens=int(usage_raw.get("completion_tokens", 0)),
+            complete=bool(usage_raw),
+            estimated=not usage_raw,
         )
         return AdapterResult(
             content=content,
@@ -159,11 +170,12 @@ class OpenAICompatAdapter(BaseAdapter):
         ttft: Optional[float] = None
         prompt_tokens = 0
         completion_tokens = 0
+        usage_seen = False  # 是否收到过上游真实 usage（用于估算/完整标记）
 
         completed = False
         try:
             async with client.stream("POST", self._endpoint, json=body, headers=headers) as resp:
-                self._raise_for_status(resp)
+                await self._raise_for_status(resp)
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -184,6 +196,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     finish = choice.get("finish_reason")
                     usage_raw = chunk.get("usage")
                     if usage_raw:
+                        usage_seen = True
                         prompt_tokens = int(usage_raw.get("prompt_tokens", prompt_tokens))
                         completion_tokens = int(usage_raw.get("completion_tokens", completion_tokens))
                     if text or finish:
@@ -204,7 +217,8 @@ class OpenAICompatAdapter(BaseAdapter):
                     yield StreamEvent(
                         delta="",
                         finish_reason=None,
-                        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+                        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                                    complete=usage_seen, estimated=not usage_seen),
                         ttft_ms=ttft,
                     )
                 except GeneratorExit:

@@ -34,6 +34,9 @@ class ProviderConfig:
     capacity: int = 10
     timeout: float = 60.0
     model_aliases: dict[str, str] = field(default_factory=dict)
+    # 原生结构化输出能力：json_schema | json_object | none
+    #（none 表示不支持 response_format，由适配器用提示约束兜底，如 Anthropic）
+    structured_output: str = "json_object"
 
     def resolve_api_key(self) -> str:
         """从环境变量动态解析 API Key（支持后续轮换，H4）。"""
@@ -220,6 +223,7 @@ class ConfigurationManager:
                 capacity=int(_get(p, "capacity", 10)),
                 timeout=float(_get(p, "timeout", 60.0)),
                 model_aliases={str(k): str(v) for k, v in (_get(p, "model_aliases", {}) or {}).items()},
+                structured_output=str(_get(p, "structured_output", "json_object")),
             )
 
         # available_models

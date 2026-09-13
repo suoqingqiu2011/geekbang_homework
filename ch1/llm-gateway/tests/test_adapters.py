@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .mock_upstream import take_openai_requests
+
 
 def _headers() -> dict[str, str]:
     return {"Authorization": "Bearer sk-test"}
@@ -100,6 +102,43 @@ async def test_openai_compat_stream(multi_gateway):
     text = r.text
     assert "Hello" in text and "world" in text
     assert "data: [DONE]" in text
+
+
+# #5（双协议对称）：OpenAI 兼容族非流式请求同样向上游透传 X-Trace-Id，
+# 与流式路径及 Anthropic 适配器一致，保证全链路追踪对称。
+async def test_openai_compat_trace_header_non_streaming(multi_gateway):
+    # 先发一次流式请求（确认捕获机制工作），再发非流式请求
+    r_stream = await multi_gateway["client"].post(
+        "/v1/chat/completions", json=_req("gpt-4o", stream=True), headers=_headers()
+    )
+    assert r_stream.status_code == 200
+    take_openai_requests()  # 清空流式记录，聚焦非流式
+
+    r = await multi_gateway["client"].post(
+        "/v1/chat/completions", json=_req("gpt-4o"), headers=_headers()
+    )
+    assert r.status_code == 200
+
+    captured = take_openai_requests()
+    non_stream = [c for c in captured if not c["stream"]]
+    # 非流式请求必须被捕获，且每一条都携带非空 X-Trace-Id（此前遗漏，现已修复）。
+    # 注：网关非流式路径可能对同一次请求产生重试，因此同一 trace_id 出现多次属正常，
+    # 我们仅断言"所有非流式请求都透传了 trace 头"。
+    assert len(non_stream) >= 1
+    assert all(c["x_trace_id"] for c in non_stream)
+
+
+# 流式路径同样透传 X-Trace-Id（基线，与 #5 修复后对称）
+async def test_openai_compat_trace_header_streaming(multi_gateway):
+    take_openai_requests()
+    r = await multi_gateway["client"].post(
+        "/v1/chat/completions", json=_req("gpt-4o", stream=True), headers=_headers()
+    )
+    assert r.status_code == 200
+    captured = take_openai_requests()
+    stream = [c for c in captured if c["stream"]]
+    assert len(stream) == 1
+    assert stream[0]["x_trace_id"]
 
 
 # ─────────────────────────────────────────────────────────────

@@ -15,12 +15,12 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 
 # 2. 配置（填入各 Provider Key；密钥不硬编码，均从环境变量读取）
-Copy-Item .env.example .env       # 再编辑 .env 填入真实 Key
+#    编辑 .env 填入真实 Key（.env 已随项目提供，勿提交到仓库）
 $env:DEEPSEEK_API_KEY = "sk-your-key"   # 或临时设置单个变量
 
-# 3. 启动
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-# 或 python -m app.main
+# 3. 启动（务必用虚拟环境解释器；系统 python 未装项目依赖，
+#    会报 ModuleNotFoundError: No module named 'dotenv'）
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 4. 冒烟
 curl.exe http://127.0.0.1:8000/healthz

@@ -40,6 +40,21 @@ from .storage.metrics_store import MetricsStore
 logger = logging.getLogger("llm-gateway")
 
 
+def _jsonable(value: object) -> object:
+    """将 Pydantic 校验错误递归转换为 JSON 可序列化的结构。
+
+    exc.errors() 中自定义 validator 抛出的 ValueError 等异常对象会出现在
+    'ctx' 字段里，直接 json.dumps 会失败；此处统一转为字符串。
+    """
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _build_context(cfg_mgr: ConfigurationManager) -> AppContext:
     cfg = cfg_mgr.config
     store = MetricsStore(cfg.db_path)
@@ -92,6 +107,13 @@ async def _reconfigure(ctx: AppContext) -> None:
         cfg.circuit.failure_threshold,
         cfg.circuit.recovery_timeout,
         cfg.circuit.half_open_max_calls,
+    )
+    # ★ 缺陷B 修复：连接池参数纳入热更新（原仅限流/熔断刷新，http_pool 需重启才生效）
+    await ctx.http_pool.update_params(
+        cfg.http_pool.max_connections,
+        cfg.http_pool.max_keepalive,
+        cfg.http_pool.connect_timeout,
+        cfg.http_pool.read_timeout,
     )
     logger.info("Runtime params refreshed after config reload (v%d)", ctx.config_manager.version)
 
@@ -182,7 +204,7 @@ def create_app() -> FastAPI:
                     "code": "invalid_request",
                     "message": "Request validation failed",
                     "type": "invalid_request",
-                    "details": exc.errors(),
+                    "details": _jsonable(exc.errors()),
                     "trace_id": "",
                 }
             },

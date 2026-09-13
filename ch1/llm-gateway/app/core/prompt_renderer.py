@@ -28,24 +28,32 @@ class PromptRenderer:
     def __init__(self, store: MetricsStore) -> None:
         self._store = store
         self._env = Environment(undefined=StrictUndefined, autoescape=False)
-        # 内存缓存：template_id -> content（模板更新由 upsert 后失效）
-        self._cache: dict[str, str] = {}
+        # 内存缓存：(template_id, version) -> content（模板更新由 upsert 后失效）
+        self._cache: dict[tuple[str, int | None], str] = {}
 
     def invalidate(self, template_id: str) -> None:
-        self._cache.pop(template_id, None)
+        for key in [k for k in self._cache if k[0] == template_id]:
+            self._cache.pop(key, None)
 
     def _extract_vars(self, content: str) -> set[str]:
         return set(_VAR_PATTERN.findall(content))
 
-    async def render(self, template_id: str, variables: dict[str, Any]) -> str:
-        """渲染模板。缺失变量 → PromptMissingVarsError。"""
-        content = self._cache.get(template_id)
+    async def render(
+        self, template_id: str, variables: dict[str, Any], version: int | None = None
+    ) -> str:
+        """渲染模板。缺失变量 → PromptMissingVarsError。
+
+        version=None → 使用最新版本；否则精确渲染指定版本。
+        """
+        key = (template_id, version)
+        content = self._cache.get(key)
         if content is None:
-            record = await self._store.get_template(template_id)
+            record = await self._store.get_template(template_id, version=version)
             if record is None:
-                raise InvalidRequestError(f"Prompt template not found: {template_id}")
+                ver_desc = f" (version {version})" if version is not None else ""
+                raise InvalidRequestError(f"Prompt template not found: {template_id}{ver_desc}")
             content = record["content"]
-            self._cache[template_id] = content
+            self._cache[key] = content
 
         required = self._extract_vars(content)
         missing = required - set(variables.keys())
@@ -60,6 +68,7 @@ class PromptRenderer:
         except TemplateSyntaxError as exc:
             raise InvalidRequestError(f"Prompt template '{template_id}' syntax error: {exc}") from exc
 
-    async def upsert(self, template_id: str, name: str, content: str) -> None:
-        await self._store.upsert_template(template_id, name, content)
+    async def upsert(self, template_id: str, name: str, content: str) -> int:
+        version = await self._store.upsert_template(template_id, name, content)
         self.invalidate(template_id)
+        return version

@@ -5,6 +5,7 @@ from __future__ import annotations
 import yaml
 
 from app.core.config_manager import ConfigurationManager
+from app.core.http_client_pool import SharedHttpClientPool
 
 
 def _write(path, providers=None, api_keys=None):
@@ -82,3 +83,35 @@ async def test_api_keys_env_override(tmp_path, monkeypatch):
     cm = ConfigurationManager(config_path=str(p))
     await cm.reload()
     assert cm.get_api_keys() == ["env-key-1", "env-key-2"]
+
+
+# ─────────────────────────────────────────────────────────────
+# ★ 缺陷B 回归：连接池参数热更新——旧客户端关闭重建，新参数生效
+# ─────────────────────────────────────────────────────────────
+async def test_http_pool_update_params_rebuilds_clients():
+    pool = SharedHttpClientPool(
+        max_connections=10, max_keepalive=3, connect_timeout=1.0, read_timeout=2.0
+    )
+    await pool.initialize()
+    try:
+        c1 = await pool.get_client("http://a")
+        assert pool._url_clients["http://a"] is c1
+
+        # 热更新：参数刷新 + 旧客户端全部关闭重建（httpx 参数在创建时固化）
+        await pool.update_params(50, 10, 3.0, 9.0)
+        assert pool.max_connections == 50
+        assert pool.max_keepalive == 10
+        assert pool.connect_timeout == 3.0
+        assert pool.read_timeout == 9.0
+        assert pool._url_clients == {}  # 旧客户端已从池中移除
+
+        # 重新获取：按新参数惰性重建（新实例 + 新 timeout 生效）
+        c2 = await pool.get_client("http://a")
+        assert c2 is not c1
+        assert c2.timeout.connect == 3.0
+        assert c2.timeout.read == 9.0
+        # 未更新的 URL 也重建为同一新实例
+        c3 = await pool.get_client("http://a")
+        assert c3 is c2
+    finally:
+        await pool.close()

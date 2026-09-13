@@ -37,6 +37,17 @@ class RetryPolicy:
     max_backoff: float = 8.0
     jitter: float = 0.2
 
+    def backoff_for(self, attempt: int) -> float:
+        """第 attempt 次的退避秒数：指数 + 抖动，且受 max_backoff 截断。
+
+        作为重试退避的**单一事实来源**（execute 与流式 _handle_stream 共用），
+        保证两路退避策略一致（原流式用线性 0.5*attempt，与 RetryPolicy 指数+抖动不一致）。
+        """
+        if attempt < 1:
+            return 0.0
+        exp = min(self.max_backoff, self.base_backoff * (2 ** (attempt - 1)))
+        return exp * (1 + random.uniform(0, self.jitter))
+
 
 @dataclass
 class CallOutcome:
@@ -120,10 +131,7 @@ class RetryFallbackManager:
                         break
 
                     if self.is_retryable(gw_exc) and attempt < self.policy.max_attempts:
-                        backoff = min(
-                            self.policy.max_backoff,
-                            self.policy.base_backoff * (2 ** (attempt - 1)),
-                        ) * (1 + random.uniform(0, self.policy.jitter))
+                        backoff = self.policy.backoff_for(attempt)
                         logger.warning(
                             "Retry provider=%s model=%s attempt=%d/%d backoff=%.2fs err=%s",
                             candidate.provider, candidate.model_name, attempt, self.policy.max_attempts, backoff, gw_exc,
@@ -139,17 +147,18 @@ class RetryFallbackManager:
                     )
                     break
 
-            else:
-                # 成功（未 break 且未异常）
-                await self._circuit.record_success(store, candidate.provider)
-                return CallOutcome(
-                    provider=candidate.provider,
-                    model=candidate.model_name,
-                    attempts=attempts_total,
-                    success=True,
-                    result=result,
-                    circuit_reason=decision.reason,
-                )
+                else:
+                    # 成功：立即返回，不得落入 for...else 继续下一次 attempt
+                    #（否则成功路径会重复调用上游，如 400 降级成功后仍发起第二次尝试）
+                    await self._circuit.record_success(store, candidate.provider)
+                    return CallOutcome(
+                        provider=candidate.provider,
+                        model=candidate.model_name,
+                        attempts=attempts_total,
+                        success=True,
+                        result=result,
+                        circuit_reason=decision.reason,
+                    )
 
         # 全部候选失败
         err = last_error or UpstreamError("All candidates failed")

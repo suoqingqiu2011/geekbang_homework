@@ -41,6 +41,7 @@ class ChatCompletionRequest(BaseModel):
     budget_usd: float = 0.0              # 0 = 不限制（SPEC §5.2）
     trace_id: Optional[str] = None
     template_id: Optional[str] = None    # 提示词模板（SPEC §4.5）
+    template_version: Optional[int] = Field(default=None, ge=1)  # None = 使用最新版本
     template_vars: dict[str, Any] = Field(default_factory=dict)
     thinking: bool = False               # 要求高思考能力（路由权重）
 
@@ -48,6 +49,8 @@ class ChatCompletionRequest(BaseModel):
     def _check(self) -> "ChatCompletionRequest":
         if self.template_id is not None and not self.template_vars:
             raise ValueError("template_vars required when template_id is set")
+        if self.template_version is not None and self.template_id is None:
+            raise ValueError("template_id required when template_version is set")
         return self
 
     @field_validator("messages")
@@ -64,6 +67,8 @@ class UsageOut(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    complete: bool = True     # 是否完整(上游真实)用量
+    estimated: bool = False   # token 为本地估算而非上游真实计数
 
 
 class ChoiceOut(BaseModel):

@@ -89,7 +89,8 @@ async def _templates(args) -> None:
     try:
         if args.tpl_action == "list":
             cursor = await store._require_db().execute(  # noqa: SLF001
-                "SELECT template_id, name, version, updated_at FROM prompt_templates ORDER BY updated_at DESC"
+                "SELECT template_id, name, version, updated_at "
+                "FROM prompt_templates ORDER BY template_id, version"
             )
             rows = await cursor.fetchall()
             if not rows:
@@ -97,13 +98,13 @@ async def _templates(args) -> None:
             for r in rows:
                 print(f"{r['template_id']:<24} name={r['name']:<16} v{r['version']} updated={r['updated_at']:.0f}")
         elif args.tpl_action == "get":
-            rec = await store.get_template(args.template_id)
+            rec = await store.get_template(args.template_id, version=getattr(args, "version", None))
             print(json.dumps(rec, ensure_ascii=False, indent=2) if rec else "(not found)")
         elif args.tpl_action == "upsert":
-            await store.upsert_template(args.template_id, args.name, args.content)
-            print(f"upserted: {args.template_id}")
+            version = await store.upsert_template(args.template_id, args.name, args.content)
+            print(f"upserted: {args.template_id} (v{version})")
         elif args.tpl_action == "delete":
-            await store.delete_template(args.template_id)
+            await store.delete_template(args.template_id, version=getattr(args, "version", None))
             print(f"deleted: {args.template_id}")
     finally:
         await store.close()
@@ -135,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     tsub.add_parser("list").set_defaults(func=_templates)
     tget = tsub.add_parser("get")
     tget.add_argument("template_id")
+    tget.add_argument("--version", type=int, default=None)
     tget.set_defaults(func=_templates)
     tup = tsub.add_parser("upsert")
     tup.add_argument("--id", dest="template_id", required=True)
@@ -143,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     tup.set_defaults(func=_templates)
     tdel = tsub.add_parser("delete")
     tdel.add_argument("template_id")
+    tdel.add_argument("--version", type=int, default=None)
     tdel.set_defaults(func=_templates)
 
     return p

@@ -93,3 +93,28 @@ class SharedHttpClientPool:
         if force:
             return await self.recreate_for_url(base_url)
         return await self.get_client(base_url)
+
+    async def update_params(
+        self,
+        max_connections: int,
+        max_keepalive: int,
+        connect_timeout: float,
+        read_timeout: float,
+    ) -> None:
+        """配置热更新时刷新连接池参数（M4 闭环）。
+
+        httpx.Limits/Timeout 在客户端创建时固化，参数变更必须重建全部现有客户端；
+        下次 get_client 将按新参数惰性重建（旧连接随即断开，连接池冷启动）。
+        """
+        async with self._lock:
+            self.max_connections = max_connections
+            self.max_keepalive = max_keepalive
+            self.connect_timeout = connect_timeout
+            self.read_timeout = read_timeout
+            for url, client in list(self._url_clients.items()):
+                await client.aclose()
+            self._url_clients.clear()
+            logger.info(
+                "HTTP Client Pool params refreshed (max=%d, keepalive=%d, connect=%.1fs, read=%.1fs)",
+                max_connections, max_keepalive, connect_timeout, read_timeout,
+            )

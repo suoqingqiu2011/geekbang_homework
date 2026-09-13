@@ -14,10 +14,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..core.circuit_breaker import CircuitBreakerManager
-from ..errors import ModelUnavailableError
+from ..errors import BudgetExhaustedError, ModelUnavailableError
 from ..storage.metrics_store import MetricsStore
 
 logger = logging.getLogger("llm-gateway.router")
+
+# 调用方未指定 max_tokens 时，按此 token 上限预估候选最大可能成本（预算核算用）
+_DEFAULT_EST_TOKENS = 2048
 
 
 @dataclass
@@ -96,6 +99,7 @@ class Router:
         thinking_required: bool = False,
         budget_usd: float = 0.0,
         spent_usd: float = 0.0,
+        max_tokens: Optional[int] = None,
     ) -> list[Candidate]:
         """
         返回按优先级排序的候选链。
@@ -111,16 +115,29 @@ class Router:
                 raise ModelUnavailableError(f"Model not available: {requested_model}")
             cands = matched
 
-        # 预算硬约束：预算无法覆盖最小成本（1 token）即视为耗尽
-        if budget_usd > 0:
-            min_cost = min((c.cost_per_million for c in cands), default=0.0) / 1_000_000.0
-            if spent_usd + min_cost > budget_usd:
-                from ..errors import BudgetExhaustedError
-                raise BudgetExhaustedError(
-                    f"Budget exhausted: spent=${spent_usd:.6f}, min cost=${min_cost:.6f} > budget=${budget_usd:.6f}"
-                )
-
         ordered = self.score_candidates(cands, thinking_required)
+
+        # ★ 缺陷C 修复：预算核算从"最小成本(1 token)"升级为"候选最大可能成本"——
+        #   按 max_tokens（缺省 _DEFAULT_EST_TOKENS）× 单价预估，调用前就剔除
+        #   可能超支的候选，防止实际 token 用量超预算后才被发现（费用无法撤销）。
+        if budget_usd > 0:
+            est_tokens = float(max_tokens) if max_tokens else _DEFAULT_EST_TOKENS
+            kept: list[Candidate] = []
+            for c in ordered:
+                est_cost = est_tokens / 1_000_000.0 * c.cost_per_million
+                if spent_usd + est_cost <= budget_usd:
+                    kept.append(c)
+                else:
+                    logger.info(
+                        "Candidate filtered by budget: %s (est max cost $%.6f > remaining $%.6f)",
+                        c.model_name, est_cost, budget_usd - spent_usd,
+                    )
+            ordered = kept
+            if not ordered:
+                raise BudgetExhaustedError(
+                    f"Budget exhausted: spent=${spent_usd:.6f}, budget=${budget_usd:.6f}, "
+                    f"no candidate fits estimated max cost (est_tokens={int(est_tokens)})"
+                )
 
         available: list[Candidate] = []
         for c in ordered:

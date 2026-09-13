@@ -20,6 +20,8 @@ from ..core.http_client_pool import SharedHttpClientPool
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    complete: bool = True     # 是否为完整(上游真实)用量
+    estimated: bool = False   # token 为本地估算(如字符数)而非上游真实计数
 
     @property
     def total_tokens(self) -> int:

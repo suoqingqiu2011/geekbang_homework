@@ -47,6 +47,7 @@ providers:
     thinking_capability: 0.8
     capacity: 10
     timeout: 60.0
+    structured_output: json_object  # 仅支持 json_object，且 prompt 需含 "json"
     model_aliases:
       deepseek-chat: deepseek-chat
       deepseek-reasoner: deepseek-reasoner
@@ -57,6 +58,7 @@ providers:
     thinking_capability: 0.9
     capacity: 10
     timeout: 60.0
+    structured_output: json_schema  # 支持原生 Structured Outputs
     model_aliases:
       gpt-5: gpt-5
       gpt-4o: gpt-4o
@@ -67,6 +69,7 @@ providers:
     thinking_capability: 0.85
     capacity: 10
     timeout: 60.0
+    structured_output: json_object
     model_aliases:
       kimi-k2: kimi-k2-thinking
       kimi-latest: moonshot-v1-128k
@@ -77,6 +80,7 @@ providers:
     thinking_capability: 0.75
     capacity: 10
     timeout: 60.0
+    structured_output: json_object
     model_aliases:
       qwen-max: qwen-max
       qwen-plus: qwen-plus
@@ -87,6 +91,7 @@ providers:
     thinking_capability: 0.95
     capacity: 5
     timeout: 60.0
+    structured_output: none  # 无原生 response_format，适配器用提示约束兜底
     model_aliases:
       claude-3-5-sonnet: claude-3-5-sonnet-20241022
   ollama:
@@ -96,6 +101,7 @@ providers:
     thinking_capability: 0.4
     capacity: 3
     timeout: 120.0
+    structured_output: json_object
     model_aliases:
       ollama-llama3: llama3
 
