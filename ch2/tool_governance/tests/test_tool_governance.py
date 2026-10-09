@@ -139,6 +139,23 @@ async def test_transfer_precheck_blocks_over_limit_and_insufficient_balance() ->
 
 
 @async_test
+async def test_transfer_rejects_self_transfer() -> None:
+    """业务预检：禁止自转账。转出与转入账户相同时，即使持有效审批也在预检阶段被拒绝，余额不变。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    self_arguments = {"from_account": FROM_ACCOUNT, "to_account": FROM_ACCOUNT, "amount": 1_000.0}
+    approve(approvals, self_arguments)
+
+    result = await transfer(runtime, "call_tr_self", self_arguments, approval_id=APPROVAL_ID)
+    assert result.ok is False
+    assert result.action is demo.DecisionAction.DENY
+    assert result.code == "SELF_TRANSFER"
+
+    # 自转账必须发生在任何扣款之前，转出账户余额不得变化。
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
 async def test_transfer_is_denied_without_permission_or_whitelist_and_in_plan_mode() -> None:
     """权限判断：带上审批也越不过 RBAC、执行白名单和 plan 只读契约。"""
 

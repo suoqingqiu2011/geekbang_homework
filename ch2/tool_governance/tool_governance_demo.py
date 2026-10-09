@@ -682,6 +682,9 @@ async def refund_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -
 async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
     arguments = raw_arguments
     assert isinstance(arguments, TransferArgs)
+    # 0. 禁止自转账：转出与转入账户相同，在预检阶段直接拒绝，避免空跑一次审批。
+    if arguments.from_account == arguments.to_account:
+        raise PolicyDenied("SELF_TRANSFER", "不能转账给自己")
     # 1. 金额区间拦截（教学专用规则）：50000 < amount <= 80000 报错，>80000 放行给任务 4 超时。
     if 50_000 < arguments.amount <= 80_000:
         raise PolicyDenied("EXCEED_LIMIT", f"转账金额 {arguments.amount} 落入教学拦截区间 (50000, 80000]")
