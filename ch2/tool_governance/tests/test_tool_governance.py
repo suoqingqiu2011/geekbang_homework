@@ -396,13 +396,43 @@ async def test_transfer_normal_execution_stays_within_timeout() -> None:
     assert balance(TO_ACCOUNT) == 6_000.0
 
 
-def test_transfer_canonical_target_includes_time_window() -> None:
-    """canonical_target 时间窗口粒度：输出为 from:to:amount:窗口（指标 Q5.3 对应）。"""
+@async_test
+async def test_transfer_idempotency_key_deduplicates_execution() -> None:
+    """幂等键：同一 idempotency_key 重复提交只执行一次，第二次在预检阶段被 DUPLICATE_REQUEST 拒绝。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    key = "idem_double_click_0001"
+    arguments = {
+        "from_account": FROM_ACCOUNT,
+        "to_account": TO_ACCOUNT,
+        "amount": 1_000.0,
+        "idempotency_key": key,
+    }
+
+    approve(approvals, arguments)
+    first = await transfer(runtime, "call_tr_idem_1", arguments, approval_id=APPROVAL_ID)
+    assert first.code == "OK"
+
+    # 同一幂等键再次提交：即使重新审批，也在预检阶段被拒绝，不再扣款。
+    approve(approvals, arguments)
+    duplicate = await transfer(runtime, "call_tr_idem_2", arguments, approval_id=APPROVAL_ID)
+    assert duplicate.ok is False
+    assert duplicate.action is demo.DecisionAction.DENY
+    assert duplicate.code == "DUPLICATE_REQUEST"
+
+    # 只执行一次：余额只变一次。
+    assert balance(FROM_ACCOUNT) == 99_000.0
+    assert balance(TO_ACCOUNT) == 6_000.0
+
+
+@async_test
+async def test_transfer_canonical_target_includes_from_to_amount() -> None:
+    """canonical_target 粒度：输出为 from:to:amount，作规则匹配的内容键（不含时间窗）。"""
 
     transfer_def = next(t for t in demo.build_tools() if t.name == TRANSFER)
     args = demo.TransferArgs(from_account=FROM_ACCOUNT, to_account=TO_ACCOUNT, amount=1_000.0)
     target = transfer_def.canonical_target(args)
 
-    # from + to + amount（float -> "1000.0"）+ 300s 窗口桶
-    expected = f"{FROM_ACCOUNT}:{TO_ACCOUNT}:1000.0:{int(time.time() // 300)}"
+    # from + to + amount（float -> "1000.0"）
+    expected = f"{FROM_ACCOUNT}:{TO_ACCOUNT}:1000.0"
     assert target == expected

@@ -123,6 +123,12 @@ class TransferArgs(StrictArgs):
     from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
     to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
     amount: float = Field(gt=0, le=100_000)
+    # 幂等键：可选。客户端对"同一逻辑意图"提供唯一值；重复提交同一 idempotency_key 会被去重，
+    # 用于防止界面双击 / 重复提交导致同一笔转账被多次执行。
+    idempotency_key: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+    )
 
 
 ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
@@ -250,7 +256,12 @@ def _stable_value(value: Any) -> Any:
 
 
 def _approval_digest(tool_name: str, arguments: ArgsModel | Mapping[str, Any]) -> str:
-    canonical = json.dumps(_stable_value(arguments), ensure_ascii=False, separators=(",", ":"))
+    # 幂等键是"请求的身份"，不是被批准的"业务内容"，故从审批摘要中剔除：
+    # 这样 approve()（原始 dict）与 consume()（校验后 model）拿到一致的摘要，审批才能匹配。
+    stable = _stable_value(arguments)
+    if isinstance(stable, Mapping) and "idempotency_key" in stable:
+        stable = {key: item for key, item in stable.items() if key != "idempotency_key"}
+    canonical = json.dumps(stable, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(f"{tool_name}:{canonical}".encode()).hexdigest()
 
 
@@ -643,9 +654,13 @@ ACCOUNTS: dict[tuple[str, str], float] = {
 }
 SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0}
 
+# 幂等去重：idempotency_key → 首次执行结果。同一 idempotency_key 只执行一次，防双击 / 重复提交。
+IDEMPOTENCY_STORE: dict[str, Mapping[str, Any]] = {}
+
 
 def reset_side_effects() -> None:
     SIDE_EFFECTS.update(refund_executions=0, shell_executions=0)
+    IDEMPOTENCY_STORE.clear()
 
 
 async def get_order_handler(
@@ -682,17 +697,20 @@ async def refund_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -
 async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
     arguments = raw_arguments
     assert isinstance(arguments, TransferArgs)
-    # 0. 禁止自转账：转出与转入账户相同，在预检阶段直接拒绝，避免空跑一次审批。
+    # 0. 幂等去重：同一 idempotency_key 已执行过 → 拒绝重复提交，避免双击直接重复扣款。
+    if arguments.idempotency_key and arguments.idempotency_key in IDEMPOTENCY_STORE:
+        raise PolicyDenied("DUPLICATE_REQUEST", "相同幂等键的转账已执行过")
+    # 1. 禁止自转账：转出与转入账户相同，在预检阶段直接拒绝，避免空跑一次审批。
     if arguments.from_account == arguments.to_account:
         raise PolicyDenied("SELF_TRANSFER", "不能转账给自己")
-    # 1. 金额区间拦截（教学专用规则）：50000 < amount <= 80000 报错，>80000 放行给任务 4 超时。
+    # 2. 金额区间拦截（教学专用规则）：50000 < amount <= 80000 报错，>80000 放行给任务 4 超时。
     if 50_000 < arguments.amount <= 80_000:
         raise PolicyDenied("EXCEED_LIMIT", f"转账金额 {arguments.amount} 落入教学拦截区间 (50000, 80000]")
-    # 2. 转出账户存在性
+    # 3. 转出账户存在性
     from_key = (context.tenant_id, arguments.from_account)
     if from_key not in ACCOUNTS:
         raise PolicyDenied("FROM_ACCOUNT_NOT_FOUND", "转出账户不存在")
-    # 3. 余额充足
+    # 4. 余额充足
     if ACCOUNTS[from_key] < arguments.amount:
         raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
 
@@ -742,13 +760,17 @@ async def transfer_handler(
     ACCOUNTS[from_key] -= arguments.amount
     ACCOUNTS[to_key] += arguments.amount
     # 返回结果
-    return {
+    result = {
         "txn_id": tool_call_id[-6:],
         "from": arguments.from_account,
         "to": arguments.to_account,
         "amount": arguments.amount,
         "status": "accepted",
     }
+    # 记录幂等结果：仅在成功执行后记录，与扣款同处无 await 临界区。
+    if arguments.idempotency_key:
+        IDEMPOTENCY_STORE[arguments.idempotency_key] = result
+    return result
 
 
 async def simulated_shell_handler(
@@ -817,9 +839,7 @@ def build_tools() -> list[ToolDefinition]:
             ),
             handler=transfer_handler,
             precheck=transfer_precheck,
-            canonical_target=lambda args: (
-                f"{args.from_account}:{args.to_account}:{args.amount}:{int(time.time() // 300)}"
-            ),
+            canonical_target=lambda args: f"{args.from_account}:{args.to_account}:{args.amount}",
         ),
     ]
 

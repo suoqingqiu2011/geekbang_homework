@@ -70,7 +70,7 @@ tool_governance/
 |---|---|
 | [tool_governance_demo.py](file:///c:/projet/homework/ch2/tool_governance/tool_governance_demo.py) | 治理框架主文件，含所有组件定义（PermissionEngine、ToolRuntime、ApprovalStore、AuditSink 等）、三个示例工具（get_order / create_refund / run_shell）及新增的 transfer 转账工具 |
 | [conftest.py](file:///c:/projet/homework/ch2/tool_governance/conftest.py) | pytest 全局 fixture，用于统一测试配置 |
-| [test_tool_governance.py](file:///c:/projet/homework/ch2/tool_governance/tests/test_tool_governance.py) | transfer 工具的 13 个验收测试用例，覆盖全部治理链路节点、自转账与审批绑定隔离 |
+| [test_tool_governance.py](file:///c:/projet/homework/ch2/tool_governance/tests/test_tool_governance.py) | transfer 工具的 14 个验收测试用例，覆盖全部治理链路节点、自转账、审批绑定隔离与幂等去重 |
 
 ---
 
@@ -179,7 +179,7 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 > - **命令链**：Bash 的 `&&` 表示"前命令成功则继续"，`||` 表示"前命令失败则继续"。PowerShell 没有原生的 `&&` 替代语法，改用 `;` 顺序执行（始终逐个执行），或用 `if ($LASTEXITCODE -eq 0) { ... }` 模拟条件链。本项目中 HTML 报告命令的 pip 与 pytest 本就可以分开运行，所以用 `;` 即可。
 > - `-k` / `-v` / `-m` / `-s` 等 pytest 选项在两环境中完全一致。
 
-### 5.3 当前测试列表（13 个用例）
+### 5.3 当前测试列表（14 个用例）
 
 | 编号 | 测试函数 | 覆盖节点 | 预期结果 |
 |---|---|---|---|
@@ -195,7 +195,8 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 | 10 | `test_transfer_timeout_is_reported_as_unknown_and_leaves_balances_untouched` | 超时处理（非幂等写超时） | `TIMEOUT_UNKNOWN`，余额不变 |
 | 11 | `test_transfer_rejects_unknown_accounts_via_mock` | 账户不存在分支（Q4.3 不确定点） | `FROM_ACCOUNT_NOT_FOUND` / `ACCOUNT_NOT_FOUND` |
 | 12 | `test_transfer_normal_execution_stays_within_timeout` | 正常不超时误杀（Q5.2 不确定点） | `OK`，耗时 < 2.0s |
-| 13 | `test_transfer_canonical_target_includes_time_window` | canonical_target 时间窗口粒度（Q5.3 不确定点） | 输出含 300s 桶 |
+| 13 | `test_transfer_idempotency_key_deduplicates_execution` | 幂等去重（防界面双击 / 重复提交） | 首次 `OK`，同键重提 `DUPLICATE_REQUEST`，余额只扣一次 |
+| 14 | `test_transfer_canonical_target_includes_from_to_amount` | canonical_target 粒度（规则匹配内容键） | 输出 `from:to:amount` |
 
 ### 5.4 测试结果解读
 
@@ -207,7 +208,7 @@ tests/test_tool_governance.py::test_transfer_yyy FAILED     ← 测试失败
 **成功标志**（两种 Shell 输出的结果一致）：
 
 ```
-============================== 13 passed in 2.11s ==============================
+============================== 14 passed in 2.11s ==============================
 ```
 
 **常见失败场景**：

@@ -97,8 +97,9 @@ ApprovalStore（一次性、参数绑定审批）   AuditSink（审计记录）
 | `from_account` | `str` | `^ACC-[A-Z]-[0-9]{6}$` | 转出账户（租户编码 + 6 位账号） |
 | `to_account` | `str` | `^ACC-[A-Z]-[0-9]{6}$` | 转入账户，同上 |
 | `amount` | `float` | `gt=0, le=100_000` | 转账金额，必须 > 0 且 ≤ 10 万 |
+| `idempotency_key` | `str` | 可选，`^[A-Za-z0-9_-]{1,64}$` | 幂等键：客户端对"同一逻辑意图"提供的唯一标识，默认 `None` |
 
-> 约束说明：正则中的 `[A-Z]` 是**账户 ID 内的租户编码位**（账户 id 格式），不是 `tenant_id`。`amount` 严格 `gt=0`——0 元转账不允许执行。
+> 约束说明：正则中的 `[A-Z]` 是**账户 ID 内的租户编码位**（账户 id 格式），不是 `tenant_id`。`amount` 严格 `gt=0`——0 元转账不允许执行。`idempotency_key` 为请求的身份而非业务内容，**不参与审批摘要与 `canonical_target`**；同一幂等键重复提交会在业务预检阶段去重，用于防止界面双击 / 重复提交导致重复扣款。
 
 ### 4.3 业务预检模块（任务 3）
 
@@ -106,9 +107,12 @@ ApprovalStore（一次性、参数绑定审批）   AuditSink（审计记录）
 
 | 顺序 | 条件 | 错误码 | 说明 |
 |---|---|---|---|
+| 0 | `idempotency_key` 非空且已存在于 `IDEMPOTENCY_STORE` | `DUPLICATE_REQUEST` | 幂等去重：同一逻辑意图已执行过，拒绝重复提交 |
 | 1 | `50_000 < amount <= 80_000` | `EXCEED_LIMIT` | 教学专用拦截区间 |
 | 2 | `(tenant_id, from_account)` 不在 `ACCOUNTS` | `FROM_ACCOUNT_NOT_FOUND` | 转出账户不存在 |
 | 3 | `ACCOUNTS[from_key] < amount` | `INSUFFICIENT_BALANCE` | 余额不足 |
+
+> 幂等判断置于最前：无论是否重新审批，只要同键请求已执行过，一律在产生任何副作用之前拦截。`reset_side_effects()` 会同时清空 `IDEMPOTENCY_STORE` 以还原模块级可变状态。
 
 **关键边界**：`amount > 80_000` 必须放行（不命中区间 1），通过余额检查与审批后进入任务 4 的超时分支。
 
@@ -120,7 +124,8 @@ ApprovalStore（一次性、参数绑定审批）   AuditSink（审计记录）
 2. **超时模拟**：若 `amount > 80_000`，先 `await asyncio.sleep(3.0)` —— **必须发生在任何余额修改之前**，让框架的 `asyncio.timeout` 先掐断执行。
 3. **转入账户校验**：`(tenant_id, to_account)` 不在 `ACCOUNTS` → `raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")`。
 4. **余额转移**：`ACCOUNTS[from_key] -= amount`；`ACCOUNTS[to_key] += amount`。
-5. **返回结果**：`txn_id`（`tool_call_id` 后 6 位）、`from`、`to`、`amount`、`status="accepted"`。
+5. **幂等记录**：若 `arguments.idempotency_key` 非空，则将结果写入 `IDEMPOTENCY_STORE[key]`，供后续同键请求在预检阶段去重。
+6. **返回结果**：`txn_id`（`tool_call_id` 后 6 位）、`from`、`to`、`amount`、`status="accepted"`。
 
 ### 4.5 工具注册模块（任务 5）
 
@@ -140,7 +145,7 @@ ApprovalStore（一次性、参数绑定审批）   AuditSink（审计记录）
 | `idempotent` | `False` |
 | `handler` | `transfer_handler` |
 | `precheck` | `transfer_precheck` |
-| `canonical_target` | `lambda args: f"{args.from_account}:{args.to_account}:{args.amount}:{int(time.time() // 300)}"`（from + to + amount + 300s 时间窗口） |
+| `canonical_target` | `lambda args: f"{args.from_account}:{args.to_account}:{args.amount}"`（from + to + amount，供 allow/deny 规则的 `target_prefix` 前缀匹配；不参与审批绑定、不含时间窗口） |
 
 ### 4.6 结果脱敏模块（任务 6）
 
@@ -163,9 +168,10 @@ value = re.sub(r"(ACC-\w-)\d{2}(\d{4})", r"\1****\2", value)
 {
   "type": "object",
   "properties": {
-    "from_account": {"type": "string", "pattern": "^ACC-[A-Z]-[0-9]{6}$"},
-    "to_account":   {"type": "string", "pattern": "^ACC-[A-Z]-[0-9]{6}$"},
-    "amount":       {"type": "number", "exclusiveMinimum": 0, "maximum": 100000}
+    "from_account":     {"type": "string", "pattern": "^ACC-[A-Z]-[0-9]{6}$"},
+    "to_account":       {"type": "string", "pattern": "^ACC-[A-Z]-[0-9]{6}$"},
+    "amount":           {"type": "number", "exclusiveMinimum": 0, "maximum": 100000},
+    "idempotency_key":  {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"}
   },
   "required": ["from_account", "to_account", "amount"],
   "additionalProperties": false
@@ -196,6 +202,7 @@ async def transfer_handler(tool_call_id: str, raw_arguments: ArgsModel, context:
 | 错误码 | 来源阶段 | 含义 |
 |---|---|---|
 | `INVALID_ARGUMENT` | Pydantic 校验 | 参数格式/额度非法或注入额外字段 |
+| `DUPLICATE_REQUEST` | 业务预检 | 同一幂等键的转账已执行过，拒绝重复提交 |
 | `EXCEED_LIMIT` | 业务预检 | 金额落入教学拦截区间 |
 | `FROM_ACCOUNT_NOT_FOUND` | 业务预检 | 转出账户不存在 |
 | `INSUFFICIENT_BALANCE` | 业务预检 | 转出账户余额不足 |
@@ -252,7 +259,7 @@ ToolRuntime.invoke("transfer", args)
 
 ### 6.3 审批参数绑定机制
 
-审批摘要由 `_approval_digest` 基于 `canonical_target` 的稳定序列化 + `tool_name` 计算 SHA-256。`ApprovalStore.consume` 校验：
+审批摘要由 `_approval_digest` 基于完整参数的稳定序列化（**剔除 `idempotency_key`**）+ `tool_name` 计算 SHA-256。`ApprovalStore.consume` 校验：
 
 - `user_id`、`tenant_id`、`tool_name` 完全一致；
 - `digest` 逐字节匹配（即 `from`、`to`、`amount` 任一变化都会导致摘要不同）；
@@ -302,7 +309,7 @@ cd c:\projet\homework\ch2
 python -m pytest tests/test_tool_governance.py -v -k "transfer"
 ```
 
-**预期**：5 个测试全部 PASSED。
+**预期**：14 个测试全部 PASSED。
 
 ### 9.3 验收标准（非测试补充项）
 
@@ -332,7 +339,8 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 5. **超时**：`90_000` → `TIMEOUT_UNKNOWN`，耗时 < 3.0s，余额不变。
 6. **账户不存在（mock `ACC-A-999999`）**：转出不存在 → `FROM_ACCOUNT_NOT_FOUND`；转入不存在 → `ACCOUNT_NOT_FOUND`（验证 `PolicyDenied` 被 `invoke` 捕获映射为 DENY，对应不确定点 Q4.3）。
 7. **正常执行不超时误杀**：普通金额转账耗时 < `timeout_seconds=2.0`，返回 `OK`，余额变更正确（对应不确定点 Q5.2）。
-8. **canonical_target 时间窗口粒度**：断言 `canonical_target` 输出为 `from:to:amount:窗口`（300s 桶，对应不确定点 Q5.3）。
+8. **canonical_target 内容键粒度**：断言 `canonical_target` 输出为 `from:to:amount`（**不含时间窗**，仅作 allow/deny 规则前缀匹配，对应不确定点 Q5.3）。
+9. **幂等去重**：同一 `idempotency_key` 第一次执行返回 `OK` 且余额扣减一次；相同键重新审批后再次提交返回 `DUPLICATE_REQUEST`，余额不再变化。
 
 ### 10.3 状态隔离
 
@@ -351,8 +359,8 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 **决策规则**：
 
 1. **节点全覆盖**：参数校验、业务预检、权限、审批、执行、脱敏、审计七个节点，每节点至少一个成功路径 + 一个反例。
-2. **错误码分支覆盖**：每个错误码（`INVALID_ARGUMENT / EXCEED_LIMIT / FROM_ACCOUNT_NOT_FOUND / INSUFFICIENT_BALANCE / ACCOUNT_NOT_FOUND / PERMISSION_DENIED / TOOL_NOT_ALLOWED / PLAN_MODE_DENIED / APPROVAL_REQUIRED / TIMEOUT_UNKNOWN`）都必须有可命中的用例。
-3. **不确定点显性化（用 mock 数据固定）**：将前序设计审查中标记"待测试验证"的不确定点全部落实为可重复测试——`ACCOUNT_NOT_FOUND` 是否被 `invoke` 捕获（Q4.3）、正常转账是否在 `timeout_seconds=2.0` 内完成不被误杀（Q5.2）、`canonical_target` 是否含 300s 时间窗口桶（Q5.3）。
+2. **错误码分支覆盖**：每个错误码（`INVALID_ARGUMENT / DUPLICATE_REQUEST / EXCEED_LIMIT / FROM_ACCOUNT_NOT_FOUND / INSUFFICIENT_BALANCE / ACCOUNT_NOT_FOUND / PERMISSION_DENIED / TOOL_NOT_ALLOWED / PLAN_MODE_DENIED / APPROVAL_REQUIRED / TIMEOUT_UNKNOWN`）都必须有可命中的用例。
+3. **不确定点显性化（用 mock 数据固定）**：将前序设计审查中标记"待测试验证"的不确定点全部落实为可重复测试——`ACCOUNT_NOT_FOUND` 是否被 `invoke` 捕获（Q4.3）、正常转账是否在 `timeout_seconds=2.0` 内完成不被误杀（Q5.2）、`canonical_target` 输出为 `from:to:amount` 内容键且不含时间窗（Q5.3）。
 4. **禁止直接调用 handler**：所有子路径（含业务错误）都必须经由 `runtime.invoke()` 触发，不绕过框架。
 5. **状态隔离**：`isolated_accounts` fixture 在用例前后对 `ACCOUNTS` 快照还原；`approve`/`reset_side_effects` 保证审批与副作用互相独立、可重复。
 
@@ -373,9 +381,9 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 
 ## 12. 范围外（Out of Scope）
 
-- 并发/分布式事务与锁机制（超卖防护）。
+- 并发/分布式事务与锁机制（超卖防护，协程级并发竞态；本作业为单线程顺序执行）。
 - 真实支付渠道、账务系统对接。
-- 转账的幂等键 / 对账 / 冲正机制。
+- 转账的对账 / 冲正机制、跨实例共享的幂等存储（当前 `IDEMPOTENCY_STORE` 为进程内内存 dict）。
 - 审批的持久化存储（当前为内存 `ApprovalStore`）。
 - 更宽泛的租户/账户动态接入（当前仅 A/B 租户编码，正则固定 `[A-Z]`）。
 - `PermissionEngine.decide` 优先级语义的任何调整。
@@ -385,7 +393,7 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 ## 13. 扩展性考虑（Extensibility Considerations）
 
 1. **账户编码扩展**：当前正则 `[A-Z]` 仅覆盖单字母租户编码；若需 `tenant_c` 等多编码或更复杂编码，可将正则抽为可配置常量，避免散落硬编码。
-2. **审批去重**：`canonical_target` 采用 from + to + amount + 300s 时间窗口的粒度，`from:to:amount:窗口` 内相同的转账视为同一目标，叠加时间窗维度以抑制窗口内的重复提交；如仍需更强幂等，可在未来叠加 `txn_id` 维度。
+2. **审批去重**：`canonical_target` 采用 from + to + amount 的内容键粒度，仅服务 allow/deny 规则的 `target_prefix` 前缀匹配，**不参与审批绑定、不含时间窗口**；审批绑定由完整参数 SHA-256 摘要（`_approval_digest`）承担。防界面双击等重复提交由**幂等键**（`idempotency_key` + `IDEMPOTENCY_STORE`）在业务预检阶段去重，区别于限流：幂等键识别"同一逻辑意图"并只放行一次。
 3. **并发安全**：若未来引入真实并发，可在 handler 内以 `asyncio.Lock` 或账户级锁保护余额读写；本作业刻意省略以聚焦治理链路。
 4. **审计持久化**：`AuditSink` 目前为内存列表，可替换为日志/数据库 sink 而不改调用方。
 5. **审批存储**：`ApprovalStore` 可替换为 Redis/DB 实现，接口 `approve/consume` 保持不变。
