@@ -70,7 +70,7 @@ tool_governance/
 |---|---|
 | [tool_governance_demo.py](file:///c:/projet/homework/ch2/tool_governance/tool_governance_demo.py) | 治理框架主文件，含所有组件定义（PermissionEngine、ToolRuntime、ApprovalStore、AuditSink 等）、三个示例工具（get_order / create_refund / run_shell）及新增的 transfer 转账工具 |
 | [conftest.py](file:///c:/projet/homework/ch2/tool_governance/conftest.py) | pytest 全局 fixture，用于统一测试配置 |
-| [test_tool_governance.py](file:///c:/projet/homework/ch2/tool_governance/tests/test_tool_governance.py) | transfer 工具的 8 个验收测试用例，覆盖全部治理链路节点 |
+| [test_tool_governance.py](file:///c:/projet/homework/ch2/tool_governance/tests/test_tool_governance.py) | transfer 工具的 13 个验收测试用例，覆盖全部治理链路节点、自转账与审批绑定隔离 |
 
 ---
 
@@ -179,18 +179,23 @@ python -m pytest tests/test_tool_governance.py -v -k "transfer"
 > - **命令链**：Bash 的 `&&` 表示"前命令成功则继续"，`||` 表示"前命令失败则继续"。PowerShell 没有原生的 `&&` 替代语法，改用 `;` 顺序执行（始终逐个执行），或用 `if ($LASTEXITCODE -eq 0) { ... }` 模拟条件链。本项目中 HTML 报告命令的 pip 与 pytest 本就可以分开运行，所以用 `;` 即可。
 > - `-k` / `-v` / `-m` / `-s` 等 pytest 选项在两环境中完全一致。
 
-### 5.3 当前测试列表（8 个用例）
+### 5.3 当前测试列表（13 个用例）
 
 | 编号 | 测试函数 | 覆盖节点 | 预期结果 |
 |---|---|---|---|
 | 1 | `test_transfer_rejects_injected_arguments_and_invalid_amount` | 参数校验（拒绝注入） | `INVALID_ARGUMENT` |
 | 2 | `test_transfer_precheck_blocks_over_limit_and_insufficient_balance` | 业务预检（金额拦截 + 余额不足） | `EXCEED_LIMIT` / `INSUFFICIENT_BALANCE` |
-| 3 | `test_transfer_is_denied_without_permission_or_whitelist_and_in_plan_mode` | 权限判断（RBAC + 白名单 + plan 模式） | `PERMISSION_DENIED` / `TOOL_NOT_ALLOWED` / `PLAN_MODE_DENIED` |
-| 4 | `test_transfer_requires_approval_bound_to_arguments_and_masks_accounts` | 审批绑定 + 成功路径 + 脱敏 + 审计 + 防重放 | `CONFIRM` → `APPROVED` → `OK`，账号已脱敏 |
-| 5 | `test_transfer_timeout_is_reported_as_unknown_and_leaves_balances_untouched` | 超时处理（非幂等写超时） | `TIMEOUT_UNKNOWN`，余额不变 |
-| 6 | `test_transfer_rejects_unknown_accounts_via_mock` | 账户不存在分支（Q4.3 不确定点） | `FROM_ACCOUNT_NOT_FOUND` / `ACCOUNT_NOT_FOUND` |
-| 7 | `test_transfer_normal_execution_stays_within_timeout` | 正常不超时误杀（Q5.2 不确定点） | `OK`，耗时 < 2.0s |
-| 8 | `test_transfer_canonical_target_includes_time_window` | canonical_target 时间窗口粒度（Q5.3 不确定点） | 输出含 300s 桶 |
+| 3 | `test_transfer_rejects_self_transfer` | 业务预检（自转账拦截） | `SELF_TRANSFER` |
+| 4 | `test_transfer_is_denied_without_permission_or_whitelist_and_in_plan_mode` | 权限判断（RBAC + 白名单 + plan 模式） | `PERMISSION_DENIED` / `TOOL_NOT_ALLOWED` / `PLAN_MODE_DENIED` |
+| 5 | `test_transfer_requires_approval_bound_to_arguments_and_masks_accounts` | 审批绑定 + 成功路径 + 脱敏 + 审计 + 防重放 | `CONFIRM` → `APPROVED` → `OK`，账号已脱敏 |
+| 6 | `test_transfer_approval_expires_after_ttl` | 审批时效（TTL 过期） | `CONFIRM` / `APPROVAL_REQUIRED` |
+| 7 | `test_transfer_approval_rejected_for_different_user` | 审批跨用户隔离 | `CONFIRM` / `APPROVAL_REQUIRED` |
+| 8 | `test_transfer_approval_rejected_for_different_tenant` | 审批跨租户隔离 | `CONFIRM` / `APPROVAL_REQUIRED` |
+| 9 | `test_transfer_approval_rejected_for_different_tool` | 审批跨工具隔离 | `CONFIRM` / `APPROVAL_REQUIRED` |
+| 10 | `test_transfer_timeout_is_reported_as_unknown_and_leaves_balances_untouched` | 超时处理（非幂等写超时） | `TIMEOUT_UNKNOWN`，余额不变 |
+| 11 | `test_transfer_rejects_unknown_accounts_via_mock` | 账户不存在分支（Q4.3 不确定点） | `FROM_ACCOUNT_NOT_FOUND` / `ACCOUNT_NOT_FOUND` |
+| 12 | `test_transfer_normal_execution_stays_within_timeout` | 正常不超时误杀（Q5.2 不确定点） | `OK`，耗时 < 2.0s |
+| 13 | `test_transfer_canonical_target_includes_time_window` | canonical_target 时间窗口粒度（Q5.3 不确定点） | 输出含 300s 桶 |
 
 ### 5.4 测试结果解读
 
@@ -202,7 +207,7 @@ tests/test_tool_governance.py::test_transfer_yyy FAILED     ← 测试失败
 **成功标志**（两种 Shell 输出的结果一致）：
 
 ```
-============================== 8 passed in 2.11s ==============================
+============================== 13 passed in 2.11s ==============================
 ```
 
 **常见失败场景**：

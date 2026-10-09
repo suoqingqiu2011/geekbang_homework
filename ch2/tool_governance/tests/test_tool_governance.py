@@ -239,6 +239,86 @@ async def test_transfer_requires_approval_bound_to_arguments_and_masks_accounts(
 
 
 @async_test
+async def test_transfer_approval_expires_after_ttl() -> None:
+    """人工审批：审批有过期时间（TTL 300s），过期后即使参数一致也无法放行，回到 CONFIRM。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
+
+    # 用可控时钟替换 demo 模块里的 time.time，让审批签发后越过 TTL 再消费。
+    fake_time = {"now": 1_000_000.0}
+    original_time = demo.time.time
+    demo.time.time = lambda: fake_time["now"]
+    try:
+        approve(approvals, arguments)  # expires_at = now + 300
+        fake_time["now"] += 301  # 越过 300s TTL
+        expired = await transfer(runtime, "call_tr_expired", arguments, approval_id=APPROVAL_ID)
+    finally:
+        demo.time.time = original_time
+
+    assert expired.ok is False
+    assert expired.action is demo.DecisionAction.CONFIRM
+    assert expired.code == "APPROVAL_REQUIRED"
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
+async def test_transfer_approval_rejected_for_different_user() -> None:
+    """人工审批：审批绑定到颁发它的 user_id，其它用户不能消费同一张审批。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
+    approve(approvals, arguments)  # 绑定 user_id="u_100"
+
+    other_user = await transfer(
+        runtime, "call_tr_other_user", arguments, approval_id=APPROVAL_ID, user_id="u_admin"
+    )
+    assert other_user.action is demo.DecisionAction.CONFIRM
+    assert other_user.code == "APPROVAL_REQUIRED"
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
+async def test_transfer_approval_rejected_for_different_tenant() -> None:
+    """人工审批：审批绑定到颁发它的 tenant_id，其它租户不能消费同一张审批。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
+    approve(approvals, arguments)  # 绑定 tenant_id="tenant_a"
+
+    # 预检会先按调用租户去查账户，目标租户 tenant_z 名下必须有同名账户才能走到审批步骤，
+    # 由此单独验证"审批的租户绑定"（fixture 会在用例结束后还原 ACCOUNTS）。
+    demo.ACCOUNTS[("tenant_z", FROM_ACCOUNT)] = 100_000.0
+    demo.ACCOUNTS[("tenant_z", TO_ACCOUNT)] = 5_000.0
+    other_tenant = await transfer(
+        runtime, "call_tr_other_tenant", arguments, approval_id=APPROVAL_ID, tenant_id="tenant_z"
+    )
+    assert other_tenant.action is demo.DecisionAction.CONFIRM
+    assert other_tenant.code == "APPROVAL_REQUIRED"
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
+async def test_transfer_approval_rejected_for_different_tool() -> None:
+    """人工审批：审批绑定到工具名，用别的工具签发的审批无法放行 transfer。"""
+
+    runtime, approvals, _audit = demo.build_runtime()
+    arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
+    # 在同一 approval_id 下为「其它工具」create_refund 签发审批，再用它调 transfer。
+    approvals.approve(
+        APPROVAL_ID,
+        transfer_context(),
+        "create_refund",
+        {"order_id": "ord_1001", "amount": 50.0, "reason": "cross-tool demo"},
+    )
+
+    cross_tool = await transfer(runtime, "call_tr_cross_tool", arguments, approval_id=APPROVAL_ID)
+    assert cross_tool.action is demo.DecisionAction.CONFIRM
+    assert cross_tool.code == "APPROVAL_REQUIRED"
+    assert balance(FROM_ACCOUNT) == 100_000.0
+
+
+@async_test
 async def test_transfer_timeout_is_reported_as_unknown_and_leaves_balances_untouched() -> None:
     """超时处理：非幂等写超时是 TIMEOUT_UNKNOWN，且超时点必须早于扣款。"""
 
