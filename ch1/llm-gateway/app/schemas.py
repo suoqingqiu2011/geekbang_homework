@@ -17,7 +17,9 @@ class ChatMessage(BaseModel):
 
 class JsonSchemaFormat(BaseModel):
     name: str
-    schema: dict[str, Any]
+    # 字段内部命名 schema_，通过 alias="schema" 保持 wire 层键名不变，
+    # 避免遮蔽 BaseModel 废弃类方法 schema() 触发 Pydantic 遮蔽警告。
+    schema_: dict[str, Any] = Field(alias="schema", serialization_alias="schema")
 
 
 class ResponseFormat(BaseModel):

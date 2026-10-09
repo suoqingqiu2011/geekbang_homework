@@ -555,7 +555,7 @@ def _resolve_schema(body: ChatCompletionRequest) -> Optional[dict[str, Any]]:
     if body.response_format is None:
         return None
     if body.response_format.json_schema is not None:
-        return body.response_format.json_schema.schema
+        return body.response_format.json_schema.schema_
     return {"type": "object"}  # json_object 模式：至少要求合法 JSON 对象
 
 
@@ -583,7 +583,7 @@ def _upstream_response_format(
             "type": "json_schema",
             "json_schema": {
                 "name": schema.name,
-                "schema": schema.schema,
+                "schema": schema.schema_,
                 "strict": True,
             },
         }
