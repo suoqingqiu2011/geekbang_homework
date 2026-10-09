@@ -407,9 +407,15 @@ $ python -m cli.gateway_cli traces --status error
 $ python -m cli.gateway_cli traces --status success
 { ... "provider": "qwen", "model": "qwen-max", "status": "success", ... }
 $ python -m cli.gateway_cli summary
-requests      27
-total_tokens  1010
-...
+requests           29
+prompt_tokens      531
+completion_tokens  510
+total_tokens       1041
+total_cost         $0.0011
+avg_latency_ms     2710.6
+avg_ttft_ms        677.3
+providers          2
+errors             16
 ```
 
 该记录同时验证：候选链评分/重试/熔断过滤、trace 状态列与 payload 一致性、CLI 状态过滤正确。
