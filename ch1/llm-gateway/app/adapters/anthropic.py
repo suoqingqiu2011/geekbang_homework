@@ -73,9 +73,18 @@ class AnthropicAdapter(BaseAdapter):
     async def _headers(self, trace_id: str) -> dict[str, str]:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "x-api-key": self.provider.resolve_api_key(),
             "anthropic-version": _ANTHROPIC_VERSION,
         }
+        key = self.provider.resolve_api_key()
+        if key:
+            headers["x-api-key"] = key
+        elif self.provider.api_key_env:
+            # 与 openai_compat 一致：缺 Key 显式抛配置缺失错误（不发出非法空头）
+            raise InvalidAuthError(
+                f"API key not configured for provider {self.provider.name} "
+                f"(env {self.provider.api_key_env} unset)",
+                config_missing=True,
+            )
         headers.update(self._trace_headers(trace_id))
         return headers
 

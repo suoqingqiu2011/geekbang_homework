@@ -121,8 +121,11 @@ class RetryFallbackManager:
                     last_error = gw_exc
 
                     if self.is_auth_error(gw_exc):
-                        # 认证失败：不重试，映射为 502（不向客户端泄漏上游 401），跳到下一候选
-                        await self._circuit.record_failure(store, candidate.provider)
+                        # 认证失败：不重试，映射为 502（不向客户端泄漏上游 401），跳到下一候选。
+                        # 配置缺失（Key 未设置）属配置问题而非服务故障，不记入熔断失败。
+                        config_missing = getattr(gw_exc, "config_missing", False)
+                        if not config_missing:
+                            await self._circuit.record_failure(store, candidate.provider)
                         last_error = UpstreamError(
                             f"Upstream authentication failed ({candidate.provider})",
                             http_status=502,

@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, UndefinedError
 
-from ..errors import InvalidRequestError, PromptMissingVarsError
+from ..errors import InvalidRequestError, NotFoundError, PromptMissingVarsError
 from ..storage.metrics_store import MetricsStore
 
 logger = logging.getLogger("llm-gateway.prompt-renderer")
@@ -41,7 +41,7 @@ class PromptRenderer:
     async def render(
         self, template_id: str, variables: dict[str, Any], version: int | None = None
     ) -> str:
-        """渲染模板。缺失变量 → PromptMissingVarsError。
+        """渲染模板。模板不存在 → NotFoundError；缺失变量 → PromptMissingVarsError。
 
         version=None → 使用最新版本；否则精确渲染指定版本。
         """
@@ -51,7 +51,7 @@ class PromptRenderer:
             record = await self._store.get_template(template_id, version=version)
             if record is None:
                 ver_desc = f" (version {version})" if version is not None else ""
-                raise InvalidRequestError(f"Prompt template not found: {template_id}{ver_desc}")
+                raise NotFoundError(f"Prompt template not found: {template_id}{ver_desc}")
             content = record["content"]
             self._cache[key] = content
 

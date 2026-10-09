@@ -44,6 +44,16 @@ class ProviderConfig:
             return ""
         return os.environ.get(self.api_key_env, "")
 
+    def has_api_key(self) -> bool:
+        """是否具备可用 Key（路由/适配器据此过滤不可用候选）。
+
+        api_key_env 为空 = 无需 Key（如本地 ollama），视为可用；
+        api_key_env 非空但对应环境变量缺失 = 配置缺失，不可用。
+        """
+        if not self.api_key_env:
+            return True
+        return bool(self.resolve_api_key())
+
 
 @dataclass
 class RateLimitConfig:

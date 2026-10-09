@@ -141,6 +141,15 @@ class Router:
 
         available: list[Candidate] = []
         for c in ordered:
+            # 无 Key 的 provider（api_key_env 已配置但环境变量缺失）为静态不可用：
+            # 路由阶段直接剔除，避免发请求时产生非法空 Bearer 头、无效重试与误开熔断。
+            prov = providers.get(c.provider)
+            if prov is not None and not prov.has_api_key():
+                logger.info(
+                    "Candidate filtered: %s (missing api key env %s)",
+                    c.provider, prov.api_key_env,
+                )
+                continue
             # store 为 None 时跳过熔断过滤（单元测试场景）
             if store is None:
                 available.append(c)

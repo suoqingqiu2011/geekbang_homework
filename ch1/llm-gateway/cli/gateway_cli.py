@@ -35,7 +35,15 @@ async def _summary(args) -> None:
     await store.initialize()
     try:
         s = await store.query_summary()
-        print(json.dumps(s, ensure_ascii=False, indent=2))
+        print(f"requests           {s.get('requests') or 0}")
+        print(f"prompt_tokens      {s.get('prompt_tokens') or 0}")
+        print(f"completion_tokens  {s.get('completion_tokens') or 0}")
+        print(f"total_tokens       {s.get('total_tokens') or 0}")
+        print(f"total_cost         ${s.get('total_cost') or 0.0:.4f}")
+        print(f"avg_latency_ms     {s.get('avg_latency_ms') or 0.0:.1f}")
+        print(f"avg_ttft_ms        {s.get('avg_ttft_ms') or 0.0:.1f}")
+        print(f"providers          {s.get('providers') or 0}")
+        print(f"errors             {s.get('errors') or 0}")
     finally:
         await store.close()
 

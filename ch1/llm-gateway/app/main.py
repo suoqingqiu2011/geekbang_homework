@@ -19,10 +19,12 @@ from typing import AsyncIterator, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from watchfiles import Change, awatch
 
 from .api.chat import router as chat_router
+from .api.templates import router as templates_router
 from .context import AppContext
 from .core.auth import AuthCheck
 from .core.cancellation import CancellationHandler
@@ -180,6 +182,18 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(chat_router)
+    app.include_router(templates_router)
+
+    # ── 静态资源 + 模板管理页面 ────────────────────────────
+    static_dir = Path(__file__).resolve().parent / "static"
+
+    @app.get("/ui/templates", tags=["ui"], include_in_schema=False)
+    async def templates_ui() -> HTMLResponse:
+        # 友好短路径：直接返回单文件模板管理页（数据操作仍受 /v1/templates 鉴权保护）。
+        # 注意：须在 app.mount("/ui") 之前注册，否则精确路径会被 StaticFiles 优先捕获。
+        return HTMLResponse((static_dir / "templates.html").read_text(encoding="utf-8"))
+
+    app.mount("/ui", StaticFiles(directory=str(static_dir), html=True), name="ui")
 
     @app.get("/healthz", tags=["ops"])
     async def healthz(request: Request) -> dict:

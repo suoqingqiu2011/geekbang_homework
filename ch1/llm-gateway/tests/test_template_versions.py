@@ -116,13 +116,13 @@ async def test_render_specific_version_requires_existing(gateway):
     renderer = gateway["ctx"].prompt_renderer
     await renderer.upsert("tpl", "desc", "x")
 
-    from app.errors import InvalidRequestError
+    from app.errors import NotFoundError
 
     try:
         await renderer.render("tpl", {}, version=42)
-    except InvalidRequestError:
+    except NotFoundError:
         return
-    raise AssertionError("expected InvalidRequestError for missing version")
+    raise AssertionError("expected NotFoundError for missing version")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,11 +151,11 @@ async def test_chat_uses_specified_template_version(gateway):
     r = await client.post("/v1/chat/completions", json=body, headers=_headers())
     assert r.status_code == 200
 
-    # 指定不存在的版本 → invalid_request
+    # 指定不存在的版本 → not_found
     body = _req(template_id="tpl", template_version=99, template_vars={"scratch": "x"})
     r = await client.post("/v1/chat/completions", json=body, headers=_headers())
-    assert r.status_code == 400
-    assert r.json()["error"]["code"] == "invalid_request"
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
 
 
 async def test_template_version_requires_template_id(gateway):
@@ -170,5 +170,113 @@ async def test_template_version_must_be_positive(gateway):
     client = gateway["client"]
     body = _req(template_id="tpl", template_version=0, template_vars={"a": "b"})
     r = await client.post("/v1/chat/completions", json=body, headers=_headers())
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+
+
+# ─────────────────────────────────────────────────────────────
+# API 层：/v1/templates 管理端点
+# ─────────────────────────────────────────────────────────────
+async def test_templates_require_auth(gateway):
+    client = gateway["client"]
+    r = await client.get("/v1/templates")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "invalid_auth"
+
+
+async def test_templates_crud_and_versions(gateway):
+    client = gateway["client"]
+
+    # 初始为空列表
+    r = await client.get("/v1/templates", headers=_headers())
+    assert r.status_code == 200
+    assert r.json() == []
+
+    # upsert v1 / v2
+    r = await client.post("/v1/templates", json={
+        "template_id": "tpl", "name": "greet", "content": "Hi {{who}}",
+    }, headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["version"] == 1
+
+    r = await client.post("/v1/templates", json={
+        "template_id": "tpl", "name": "greet", "content": "Hello {{who}}!",
+    }, headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["version"] == 2
+
+    # list：每个 template_id 只有最新版本
+    r = await client.get("/v1/templates", headers=_headers())
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert data[0]["template_id"] == "tpl"
+    assert data[0]["version"] == 2
+    assert data[0]["content"] == "Hello {{who}}!"
+
+    # get 指定版本
+    r = await client.get("/v1/templates/tpl", params={"version": 1}, headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["content"] == "Hi {{who}}"
+
+    # get 最新版本（缺省）
+    r = await client.get("/v1/templates/tpl", headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["version"] == 2
+
+    # versions：全部历史按升序
+    r = await client.get("/v1/templates/tpl/versions", headers=_headers())
+    assert r.status_code == 200
+    assert [v["version"] for v in r.json()] == [1, 2]
+
+
+async def test_template_delete_and_render(gateway):
+    client = gateway["client"]
+    await client.post("/v1/templates", json={
+        "template_id": "tpl", "name": "greet", "content": "Hi {{who}}",
+    }, headers=_headers())
+    await client.post("/v1/templates", json={
+        "template_id": "tpl", "name": "greet", "content": "Hello {{who}}!",
+    }, headers=_headers())
+
+    # render 最新版本
+    r = await client.post("/v1/templates/tpl/render", json={"variables": {"who": "Ada"}}, headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["rendered"] == "Hello Ada!"
+
+    # 删除指定版本 v1
+    r = await client.delete("/v1/templates/tpl", params={"version": 1}, headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+
+    # 删除全部
+    r = await client.delete("/v1/templates/tpl", headers=_headers())
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+
+    # 已删空
+    r = await client.get("/v1/templates", headers=_headers())
+    assert r.json() == []
+
+
+async def test_template_not_found(gateway):
+    client = gateway["client"]
+    for method, url, kwargs in [
+        ("get", "/v1/templates/nope", {}),
+        ("get", "/v1/templates/nope/versions", {}),
+        ("delete", "/v1/templates/nope", {}),
+    ]:
+        r = await getattr(client, method)(url, headers=_headers(), **kwargs)
+        assert r.status_code == 404, (method, url, r.status_code)
+        assert r.json()["error"]["code"] == "not_found"
+    # render 不存在模板同样 404
+    r = await client.post("/v1/templates/nope/render", json={"variables": {"a": "b"}}, headers=_headers())
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+
+
+async def test_template_upsert_validation(gateway):
+    client = gateway["client"]
+    r = await client.post("/v1/templates", json={"template_id": "", "name": "n", "content": "c"}, headers=_headers())
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"

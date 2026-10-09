@@ -53,6 +53,12 @@ class InvalidAuthError(GatewayError):
     http_status = 401
     error_type = "auth_error"
 
+    def __init__(self, message: str, config_missing: bool = False, **kw):
+        """config_missing=True：上游 Key 未配置（配置问题），非真实鉴权失败，
+        调用方应跳过重试且不计入熔断失败。"""
+        super().__init__(message, **kw)
+        self.config_missing = config_missing
+
 
 class ForbiddenError(GatewayError):
     code = "forbidden"

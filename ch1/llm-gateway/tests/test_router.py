@@ -120,3 +120,40 @@ async def test_circuit_filter(tmp_path):
         assert cands[0].provider == "pricey"
     finally:
         await store.close()
+
+
+# ─────────────────────────────────────────────────────────────
+# ★ 无 Key provider 过滤：api_key_env 已配置但环境变量缺失 = 静态不可用
+# ─────────────────────────────────────────────────────────────
+async def _providers_with_keyless():
+    from app.core.config_manager import ModelEntry  # noqa: F401
+
+    providers = _providers()
+    providers["keyless"] = ProviderConfig(
+        name="keyless", api_base_url="http://z/v1", api_key_env="GATEWAY_UNSET_KEY_XYZ",
+        cost_per_million_tokens=0.5, thinking_capability=0.5, capacity=10, timeout=10.0,
+        model_aliases={"keyless-a": "keyless-a"},
+    )
+    models = _models() + [ModelEntry(name="keyless-a", provider="keyless", routing_weight=1.0)]
+    return providers, models
+
+
+async def test_candidate_filtered_when_api_key_missing():
+    """无 Key 的 provider 不应出现在候选链（避免非法空 Bearer 头/无效重试/误开熔断）。"""
+    router = Router(CircuitBreakerManager())
+    providers, models = await _providers_with_keyless()
+    cands = await router.route(None, models, providers)
+    assert cands  # keyless 被剔除，其余候选保留
+    assert all(c.provider != "keyless" for c in cands)
+
+
+async def test_all_candidates_missing_key_raises():
+    """全部候选都缺 Key → ModelUnavailableError（无可用候选）。"""
+    router = Router(CircuitBreakerManager())
+    providers, _ = await _providers_with_keyless()
+    # 把现有候选也改成缺 Key
+    for p in providers.values():
+        if p.name != "keyless":
+            p.api_key_env = "GATEWAY_UNSET_KEY_XYZ"
+    with pytest.raises(ModelUnavailableError):
+        await router.route(None, _models(), providers)

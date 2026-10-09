@@ -17,7 +17,7 @@ import asyncio
 import pytest
 
 from app.core.retry_fallback import RetryFallbackManager, RetryPolicy
-from app.errors import UpstreamError
+from app.errors import InvalidAuthError, UpstreamError
 
 
 # ─────────────────────────────────────────────────────────────
@@ -92,3 +92,38 @@ async def test_execute_stream_backoff_matches_retry_policy(gateway, monkeypatch)
     assert calls["n"] == policy.max_attempts  # 3 次全部尝试
     # attempt1 → 0.01、attempt2 → 0.02（指数）；绝非旧的线性 0.5*attempt(0.5/1.0)
     assert slept == [policy.backoff_for(1), policy.backoff_for(2)]
+
+
+# ─────────────────────────────────────────────────────────────
+# 配置缺失（无 Key）的 auth 错误：不重试、不计熔断失败
+# ─────────────────────────────────────────────────────────────
+async def test_execute_config_missing_skips_retry_and_circuit(gateway):
+    """缺 Key 抛 InvalidAuthError(config_missing=True)：不重试、不记熔断失败。
+
+    此前空 Key 会产生非法 Bearer 头 → httpcore 拒绝 → 异常无法归类为 auth
+    → 无效重试 + 误开熔断。现在 adapter 源头抛 config_missing 标记的错误。
+    """
+    mgr = RetryFallbackManager(
+        gateway["ctx"].circuit, RetryPolicy(max_attempts=3, base_backoff=0.01, jitter=0.0)
+    )
+
+    calls = {"n": 0}
+
+    async def call_one(candidate, probe=False, attempt=1) -> object:  # noqa: ARG001
+        calls["n"] += 1
+        raise InvalidAuthError("api key not configured", config_missing=True)
+
+    class _Cand:
+        provider = "ok"
+        model_name = "m"
+
+    with pytest.raises(UpstreamError):
+        await mgr.execute(gateway["ctx"].store, [_Cand()], call_one)
+
+    assert calls["n"] == 1  # 不重试
+    # 熔断器未记录失败：状态行（execute 开头的 can_pass_request 可能已初始化）须为
+    # closed 且 consecutive_failures==0，证明 config_missing 未计入熔断失败。
+    st = await gateway["ctx"].store.get_circuit_state("ok")
+    assert st is None or (st["state"] == "closed" and st["consecutive_failures"] == 0)
+    decision = await gateway["ctx"].circuit.can_pass_request(gateway["ctx"].store, "ok")
+    assert decision.allowed and decision.reason == ""

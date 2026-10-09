@@ -96,3 +96,22 @@ class ModelOut(BaseModel):
 class ModelsResponse(BaseModel):
     object: str = "list"
     data: list[ModelOut]
+
+
+class TemplateOut(BaseModel):
+    template_id: str
+    name: str
+    content: str
+    version: int
+    updated_at: float
+
+
+class TemplateUpsertRequest(BaseModel):
+    template_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class TemplateRenderRequest(BaseModel):
+    variables: dict[str, Any] = Field(default_factory=dict)
+    version: Optional[int] = Field(default=None, ge=1)

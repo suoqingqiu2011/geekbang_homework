@@ -256,7 +256,7 @@ async def _handle_completion(
     await ctx.store.record_trace(trace.snapshot())
 
     return ChatCompletionResponse(
-        id=f"chatcmpl-{trace.trace_id[:24]}",
+        id=_completion_id(trace.trace_id),
         created=int(trace.timestamp_us),
         model=outcome.model,
         choices=[
@@ -363,7 +363,7 @@ async def _handle_stream(
                                 if ev.delta:
                                     stream_chars += len(str(ev.delta))
                                 chunk: dict[str, Any] = {
-                                    "id": f"chatcmpl-{trace.trace_id[:24]}",
+                                    "id": _completion_id(trace.trace_id),
                                     "object": "chat.completion.chunk",
                                     "created": int(trace.timestamp_us),
                                     "model": candidate.model_name,
@@ -392,6 +392,17 @@ async def _handle_stream(
                     except GatewayError as exc:
                         await agen.aclose()
                         last_error = exc
+                        if getattr(exc, "config_missing", False):
+                            # 配置缺失（Key 未设置）：不重试、不计熔断，跳下一候选
+                            #（与 retry_fallback.execute 语义一致，避免误开熔断）
+                            last_error = UpstreamError(
+                                f"Upstream authentication failed ({candidate.provider})",
+                                http_status=502,
+                            )
+                            logger.warning(
+                                "Skip candidate %s (missing api key)", candidate.provider
+                            )
+                            break
                         if stream_started:
                             # 首 token 后断流：先固化"部分输出后失败"的半程观测，
                             # 再尝试后续候选/重试（区别于 cancel，语义为 partial_failed）。
@@ -531,6 +542,15 @@ async def _handle_stream(
 # ─────────────────────────────────────────────────────────────
 # 辅助
 # ─────────────────────────────────────────────────────────────
+def _completion_id(trace_id: str) -> str:
+    """OpenAI 兼容响应 id：chatcmpl-<24 位 hex>。
+
+    trace_id 为 UUID（含连字符），直接截断会留下尾部裸连字符
+    （如 chatcmpl-72648c9c-c659-4d56-accb-）：先去连字符再截位。
+    """
+    return f"chatcmpl-{trace_id.replace('-', '')[:24]}"
+
+
 def _resolve_schema(body: ChatCompletionRequest) -> Optional[dict[str, Any]]:
     if body.response_format is None:
         return None

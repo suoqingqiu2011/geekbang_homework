@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from .mock_upstream import take_openai_requests
 
 
@@ -207,3 +209,51 @@ async def test_models_exposes_all_providers(multi_gateway):
     ids = [m["id"] for m in r.json()["data"]]
     for expected in ("gpt-4o", "deepseek-chat", "kimi-k2", "qwen-max", "ollama-llama3", "claude-3-5-sonnet"):
         assert expected in ids
+
+
+# ─────────────────────────────────────────────────────────────
+# 缺 Key 行为：不构造非法空 Bearer 头（config_missing 标记），无需 Key 则不带鉴权头
+# ─────────────────────────────────────────────────────────────
+async def test_openai_compat_missing_key_raises_config_error():
+    """api_key_env 已配置但环境变量缺失 → 抛 InvalidAuthError(config_missing=True)，
+    而非发出非法的空 Authorization 头（httpcore 会拒绝并导致无效重试/误开熔断）。"""
+    from app.adapters.openai_compat import OpenAICompatAdapter
+    from app.core.config_manager import ProviderConfig
+    from app.core.http_client_pool import SharedHttpClientPool
+    from app.errors import InvalidAuthError
+
+    provider = ProviderConfig(
+        name="kimi", api_base_url="http://x/v1", api_key_env="GATEWAY_UNSET_KEY_XYZ"
+    )
+    adapter = OpenAICompatAdapter(provider, SharedHttpClientPool())
+    with pytest.raises(InvalidAuthError) as excinfo:
+        await adapter._headers()
+    assert excinfo.value.config_missing is True
+
+
+async def test_openai_compat_no_auth_header_when_key_not_required():
+    """api_key_env 为空（如本地 ollama）= 无需鉴权：不发送 Authorization 头。"""
+    from app.adapters.openai_compat import OpenAICompatAdapter
+    from app.core.config_manager import ProviderConfig
+    from app.core.http_client_pool import SharedHttpClientPool
+
+    provider = ProviderConfig(name="ollama", api_base_url="http://x/v1")
+    adapter = OpenAICompatAdapter(provider, SharedHttpClientPool())
+    headers = await adapter._headers()
+    assert "Authorization" not in headers
+
+
+async def test_anthropic_missing_key_raises_config_error():
+    """Anthropic 同样：缺 Key 抛 config_missing，不发送空 x-api-key。"""
+    from app.adapters.anthropic import AnthropicAdapter
+    from app.core.config_manager import ProviderConfig
+    from app.core.http_client_pool import SharedHttpClientPool
+    from app.errors import InvalidAuthError
+
+    provider = ProviderConfig(
+        name="anthropic", api_base_url="http://x", api_key_env="GATEWAY_UNSET_KEY_XYZ"
+    )
+    adapter = AnthropicAdapter(provider, SharedHttpClientPool())
+    with pytest.raises(InvalidAuthError) as excinfo:
+        await adapter._headers("trace-1")
+    assert excinfo.value.config_missing is True

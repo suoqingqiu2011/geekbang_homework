@@ -88,8 +88,18 @@ class OpenAICompatAdapter(BaseAdapter):
     async def _headers(self) -> dict[str, str]:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.provider.resolve_api_key()}",
         }
+        key = self.provider.resolve_api_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        elif self.provider.api_key_env:
+            # 需要 Key 但未配置：显式抛配置缺失错误，避免发出非法的空 Bearer 头
+            #（httpcore 校验失败 → 异常无法归类 → 无效重试 + 误开熔断）。
+            raise InvalidAuthError(
+                f"API key not configured for provider {self.provider.name} "
+                f"(env {self.provider.api_key_env} unset)",
+                config_missing=True,
+            )
         return headers
 
     # ── 非流式 ───────────────────────────────────────────────

@@ -10,6 +10,7 @@ MetricsStore — 异步 SQLite 指标/追踪/计费/熔断存储（G2+G3 修复�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -228,6 +229,9 @@ class MetricsStore:
     # ── Trace ─────────────────────────────────────────────────
     async def record_trace(self, trace: dict[str, Any]) -> None:
         db = self._require_db()
+        # 运行时指标固化在 trace["runtime"]（TraceFreezeRecord.snapshot()），
+        # 状态列须从 runtime 读取，否则恒为默认值 success，与 payload 不一致。
+        runtime = trace.get("runtime", {})
         await db.execute(
             """
             INSERT OR IGNORE INTO traces (
@@ -242,12 +246,12 @@ class MetricsStore:
                 trace.get("user_id", "anonymous"),
                 trace.get("project_id", "default"),
                 trace.get("client_ip", "unknown"),
-                trace.get("model", ""),
-                trace.get("provider", ""),
-                trace.get("status", "success"),
-                trace.get("error_code"),
-                trace.get("latency_ms"),
-                __import__("json").dumps(trace.get("runtime", {}), ensure_ascii=False),
+                runtime.get("model", trace.get("model", "")),
+                runtime.get("provider", trace.get("provider", "")),
+                runtime.get("status", trace.get("status", "success")),
+                runtime.get("error_code", trace.get("error_code")),
+                runtime.get("latency_ms", trace.get("latency_ms")),
+                json.dumps(runtime, ensure_ascii=False),
             ),
         )
         await db.commit()
@@ -435,9 +439,12 @@ class MetricsStore:
         cursor = await db.execute(
             """
             SELECT COUNT(*) AS requests,
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
                    SUM(total_tokens) AS total_tokens,
                    SUM(cost_usd) AS total_cost,
                    AVG(latency_ms) AS avg_latency_ms,
+                   AVG(ttft_ms) AS avg_ttft_ms,
                    COUNT(DISTINCT provider) AS providers
             FROM usage_metrics
             """
@@ -529,6 +536,19 @@ class MetricsStore:
             "SELECT template_id, name, content, version, updated_at "
             "FROM prompt_templates WHERE template_id = ? ORDER BY version ASC",
             (template_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def list_templates(self) -> list[dict[str, Any]]:
+        """返回每个 template_id 的最新版本（按 template_id 升序）。"""
+        db = self._require_db()
+        cursor = await db.execute(
+            "SELECT template_id, name, content, version, updated_at "
+            "FROM prompt_templates p "
+            "WHERE version = (SELECT MAX(version) FROM prompt_templates "
+            "                 WHERE template_id = p.template_id) "
+            "ORDER BY template_id ASC"
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]

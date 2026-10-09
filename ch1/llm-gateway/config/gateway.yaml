@@ -96,7 +96,7 @@ providers:
       claude-3-5-sonnet: claude-3-5-sonnet-20241022
   ollama:
     api_base_url: http://localhost:11434/v1
-    api_key_env: OLLAMA_API_KEY
+    # 本地服务无鉴权：不配置 api_key_env（避免无 Key 时构造非法空 Authorization 头）
     cost_per_million_tokens: 0.0
     thinking_capability: 0.4
     capacity: 3

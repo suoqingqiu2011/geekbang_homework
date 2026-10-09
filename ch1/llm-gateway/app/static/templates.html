@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Gateway · 模板管理</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #fff; --border: #e3e6ea;
+    --text: #1f2937; --muted: #6b7280; --primary: #2563eb;
+    --danger: #dc2626; --ok: #16a34a; --code: #0f172a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 24px; background: #fff; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  .auth { display: flex; gap: 8px; align-items: center; }
+  main { max-width: 1080px; margin: 24px auto; padding: 0 16px; display: grid; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; justify-content: space-between; }
+  label { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+  input, textarea {
+    width: 100%; padding: 8px 10px; margin-top: 4px; font-size: 14px;
+    border: 1px solid var(--border); border-radius: 6px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 90px; font-family: ui-monospace, Consolas, monospace; }
+  button {
+    padding: 8px 14px; font-size: 13px; border: 1px solid transparent; border-radius: 6px;
+    cursor: pointer; background: var(--primary); color: #fff; transition: opacity .15s;
+  }
+  button:hover { opacity: .9; }
+  button.ghost { background: #fff; color: var(--primary); border-color: var(--primary); }
+  button.danger { background: #fff; color: var(--danger); border-color: var(--danger); }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  td code { background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  pre {
+    background: var(--code); color: #e2e8f0; padding: 12px; border-radius: 8px;
+    font-size: 12px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+    margin: 10px 0 0; min-height: 20px;
+  }
+  .muted { color: var(--muted); }
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--text); color: #fff; padding: 10px 18px; border-radius: 8px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: 80%;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { background: var(--danger); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  .hint { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>LLM Gateway · 模板管理</h1>
+    <div class="auth">
+      <input id="apiKey" type="password" placeholder="网关 API Key" style="width: 220px;">
+      <button id="btnAuth" class="ghost">保存并测试</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>创建 / 更新模板 <span class="hint">同 template_id 重复提交会自增版本并保留历史</span></h2>
+      <div class="grid2">
+        <div>
+          <label>template_id <input id="tplId" placeholder="例如 tpl-greet"></label>
+          <label>名称 name <input id="tplName" placeholder="例如 greet"></label>
+        </div>
+        <label>内容 content（用 {{变量}} 占位）<textarea id="tplContent" placeholder="你是{{role}}助手，请回答：{{question}}"></textarea></label>
+      </div>
+      <button id="btnUpsert" style="margin-top: 6px;">提交新版本</button>
+    </section>
+
+    <section class="card">
+      <h2>模板列表 <button id="btnRefresh" class="ghost small">刷新</button></h2>
+      <table id="tplTable">
+        <thead><tr><th>template_id</th><th>name</th><th>最新版本</th><th>操作</th></tr></thead>
+        <tbody><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card" id="detailCard" style="display:none;">
+      <h2 id="detailTitle">模板详情</h2>
+      <div class="grid2">
+        <div>
+          <label>上一次渲染的 template_id <input id="renderId" readonly></label>
+          <label>版本（留空 = 最新）<input id="renderVersion" placeholder="留空 = 最新"></label>
+        </div>
+        <label>variables（JSON）<textarea id="renderVars">{"who":"Ada"}</textarea></label>
+      </div>
+      <button id="btnRender" style="margin-top: 6px;">渲染预览</button>
+      <pre id="detailOut" style="display:none;"></pre>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+
+<script>
+const API_ROOT = "/v1/templates";
+const KEY_STORE = "gw-api-key";
+
+let apiKey = localStorage.getItem(KEY_STORE) || "";
+document.getElementById("apiKey").value = apiKey;
+
+function toast(msg, isErr) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.toggle("err", !!isErr);
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+function authHeaders() {
+  const key = document.getElementById("apiKey").value.trim();
+  return key ? { "Authorization": "Bearer " + key } : {};
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(API_ROOT + path, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) }
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const code = data.error && data.error.code ? data.error.code : res.status;
+    const msg = data.error && data.error.message ? data.error.message : ("HTTP " + res.status);
+    throw new Error(code + ": " + msg);
+  }
+  return data;
+}
+
+async function testAuth() {
+  try {
+    await api("");
+    toast("鉴权通过，已连接网关", false);
+  } catch (e) {
+    toast("连接失败：" + e.message, true);
+  }
+}
+
+async function loadList() {
+  const tbody = document.querySelector("#tplTable tbody");
+  tbody.innerHTML = '<tr><td colspan="4" class="muted">加载中…</td></tr>';
+  try {
+    const list = await api("");
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="muted">（暂无模板）</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    for (const t of list) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td><code>' + esc(t.template_id) + '</code></td>' +
+        '<td>' + esc(t.name) + '</td>' +
+        '<td>' + t.version + '</td>' +
+        '<td></td>';
+      const actions = tr.querySelector("td:last-child");
+      actions.className = "row-actions";
+      actions.appendChild(btn("渲染", () => openDetail(t.template_id)));
+      actions.appendChild(btn("版本", () => showVersions(t.template_id), "ghost"));
+      actions.appendChild(btn("删除", () => delTemplate(t.template_id), "danger"));
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="4" class="muted">加载失败：' + esc(e.message) + '</td></tr>';
+    toast("加载失败：" + e.message, true);
+  }
+}
+
+function openDetail(id) {
+  document.getElementById("renderId").value = id;
+  document.getElementById("detailCard").style.display = "";
+  document.getElementById("detailTitle").textContent = "渲染预览 · " + id;
+  document.getElementById("detailOut").style.display = "none";
+  document.getElementById("detailCard").scrollIntoView({ behavior: "smooth" });
+}
+
+async function upsert() {
+  const template_id = document.getElementById("tplId").value.trim();
+  const name = document.getElementById("tplName").value.trim();
+  const content = document.getElementById("tplContent").value;
+  if (!template_id || !name || !content) { toast("template_id / name / content 均不能为空", true); return; }
+  try {
+    const created = await api("", { method: "POST", body: JSON.stringify({ template_id, name, content }) });
+    toast("已保存：" + template_id + "（v" + created.version + "）", false);
+    loadList();
+  } catch (e) { toast("保存失败：" + e.message, true); }
+}
+
+async function renderPreview() {
+  const id = document.getElementById("renderId").value.trim();
+  const version = document.getElementById("renderVersion").value.trim();
+  let vars;
+  try { vars = JSON.parse(document.getElementById("renderVars").value || "{}"); }
+  catch { toast("variables 不是合法 JSON", true); return; }
+  try {
+    const q = version ? "?version=" + encodeURIComponent(version) : "";
+    const out = await api("/" + encodeURIComponent(id) + "/render" + q, {
+      method: "POST", body: JSON.stringify({ variables: vars, ...(version ? { version: +version } : {}) })
+    });
+    showOut(JSON.stringify(out, null, 2));
+  } catch (e) { showOut("渲染失败：\n" + e.message); toast("渲染失败：" + e.message, true); }
+}
+
+async function showVersions(id) {
+  try {
+    const rows = await api("/" + encodeURIComponent(id) + "/versions");
+    const lines = rows.map(r => "v" + r.version + "  name=" + r.name + "\n" + r.content).join("\n\n");
+    openDetail(id);
+    showOut("历史版本（共 " + rows.length + " 个）：\n\n" + lines);
+  } catch (e) { toast("查询版本失败：" + e.message, true); }
+}
+
+async function delTemplate(id) {
+  if (!confirm("确认删除模板 " + id + " 的全部版本？此操作不可恢复。")) return;
+  try {
+    const out = await api("/" + encodeURIComponent(id), { method: "DELETE" });
+    toast("已删除：" + id + "（" + out.deleted + " 个版本）", false);
+    loadList();
+  } catch (e) { toast("删除失败：" + e.message, true); }
+}
+
+function showOut(text) {
+  const pre = document.getElementById("detailOut");
+  pre.textContent = text;
+  pre.style.display = "";
+}
+
+function btn(label, fn, kind) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.className = "small " + (kind || "");
+  b.onclick = fn;
+  return b;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+
+// 事件绑定
+document.getElementById("btnAuth").onclick = () => {
+  apiKey = document.getElementById("apiKey").value.trim();
+  localStorage.setItem(KEY_STORE, apiKey);
+  testAuth();
+};
+document.getElementById("btnRefresh").onclick = loadList;
+document.getElementById("btnUpsert").onclick = upsert;
+document.getElementById("btnRender").onclick = renderPreview;
+
+loadList();
+</script>
+</body>
+</html>
