@@ -15,7 +15,7 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 
 # 2. 配置（填入各 Provider Key；密钥不硬编码，均从环境变量读取）
-#    编辑 .env 填入真实 Key（.env 已随项目提供，勿提交到仓库）
+#    复制 .env.example 为 .env 并填入真实 Key（.env 已被 .gitignore 忽略，勿提交）
 $env:DEEPSEEK_API_KEY = "sk-your-key"   # 或临时设置单个变量
 
 # 3. 启动（务必用虚拟环境解释器；系统 python 未装项目依赖，
@@ -36,7 +36,7 @@ source .venv/bin/activate         # Linux/macOS 激活虚拟环境
 pip install -r requirements-dev.txt
 
 # 2. 配置（填入各 Provider Key；密钥不硬编码，均从环境变量读取）
-#    编辑 .env 填入真实 Key（.env 已随项目提供，勿提交到仓库）
+#    复制 .env.example 为 .env 并填入真实 Key（.env 已被 .gitignore 忽略，勿提交）
 export DEEPSEEK_API_KEY="sk-your-key"   # 或临时设置单个变量
 
 # 3. 启动（务必用虚拟环境解释器；系统 python 未装项目依赖，

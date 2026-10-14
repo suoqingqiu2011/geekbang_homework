@@ -227,3 +227,72 @@ async def test_upstream_400_degrades_retry_stream(gateway):
     assert any('"intent"' in str(m.get("content", "")) for m in reqs[1]["messages"]), (
         "degraded retry must embed the full schema (field names) in messages"
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# 流式结构化输出收尾校验：usage 汇总事件后追加校验状态事件
+# ─────────────────────────────────────────────────────────────
+def _parse_sse(text: str) -> list[dict[str, Any]]:
+    """把网关 SSE 响应解析为事件列表（含 [DONE] 哨兵）。"""
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            payload = line[len("data: "):]
+            if payload == "[DONE]":
+                events.append({"type": "[DONE]"})
+            else:
+                events.append(json.loads(payload))
+    return events
+
+
+async def test_stream_structured_output_appends_validation_event_ok(gateway):
+    """流式 + schema：合法 JSON → 追加校验状态事件 status=ok（在 [DONE] 前）。"""
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req("jsonstream", stream=True, response_format=RF),
+        headers=_headers(),
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events[-1] == {"type": "[DONE]"}
+    validation = [e for e in events if e.get("type") == "validation"]
+    assert len(validation) == 1
+    assert validation[0]["status"] == "ok"
+    assert validation[0]["error"] is None
+
+
+async def test_stream_structured_output_validation_error_event(gateway):
+    """流式 + schema：非法 JSON（mock 默认文本流）→ status=error + trace 观测。"""
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req("ok", stream=True, response_format=RF),
+        headers=_headers(),
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    validation = [e for e in events if e.get("type") == "validation"]
+    assert len(validation) == 1
+    assert validation[0]["status"] == "error"
+    assert validation[0]["error"] == "invalid_json"
+
+    # 观测固化：trace 携带 validation_failed / validation_error（CLI 可审计）
+    db = gateway["ctx"].store._require_db()
+    row = await (await db.execute(
+        "SELECT payload FROM traces ORDER BY rowid DESC LIMIT 1"
+    )).fetchone()
+    runtime = json.loads(row["payload"])  # payload 列即 runtime 子字典快照
+    assert runtime["validation_failed"] is True
+    assert runtime["validation_error"] == "invalid_json"
+
+
+async def test_stream_plain_chat_no_validation_event(gateway):
+    """schema=None（普通对话流）：不累积、不发校验事件，保持 OpenAI 兼容事件序列。"""
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req("ok", stream=True),  # 不带 response_format
+        headers=_headers(),
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events[-1] == {"type": "[DONE]"}
+    assert all(e.get("type") != "validation" for e in events)

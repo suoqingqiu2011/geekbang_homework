@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from app.core.rate_limiter import RateLimiter, TokenBucket
 
 
@@ -16,8 +20,6 @@ async def test_token_bucket_capacity():
 
 
 async def test_token_bucket_refill():
-    import asyncio
-
     b = TokenBucket(rate=10.0, capacity=1.0)
     ok1, _ = await b.consume()
     assert ok1
@@ -76,3 +78,72 @@ async def test_ratelimiter_max_buckets_continuous_bounded():
     for i in range(100):
         await rl.check(user_id=f"u{i}")
         assert len(rl._buckets) <= 4
+
+
+# ─────────────────────────────────────────────────────────────
+# 两阶段限流（预检 → 原子扣减）：高层拒绝不得消耗低层令牌
+# ─────────────────────────────────────────────────────────────
+async def test_rejected_request_preserves_lower_layer_tokens():
+    """model 桶不足被拒时，endpoint/project/user 低层桶令牌不得被扣减。"""
+    rl = RateLimiter(
+        rates={"model": 1.0, "endpoint": 1.0, "project": 1.0, "user": 1.0},
+        bucket_capacity=1.0,
+    )
+    # 预取各层桶并固定令牌状态：model 空（请求必被拒），低层满
+    m = await rl._bucket("m:m1", 1.0)
+    e = await rl._bucket("e:POST:/v1/x", 1.0)
+    p = await rl._bucket("p:p1", 1.0)
+    u = await rl._bucket("u:u1", 1.0)
+    async with m.lock:
+        m.tokens = 0.0
+    async with e.lock:
+        e.tokens = 1.0
+    async with p.lock:
+        p.tokens = 1.0
+    async with u.lock:
+        u.tokens = 1.0
+
+    ok, retry, layer = await rl.check(
+        model="m1", endpoint_key="POST:/v1/x", project_id="p1", user_id="u1"
+    )
+    assert not ok
+    assert layer == "model"
+    assert retry > 0
+
+    # 低层桶未被扣减（旧实现会在此路径先扣后判，低层被消耗到 ~0）
+    assert e.tokens == pytest.approx(1.0, abs=0.01)
+    assert p.tokens == pytest.approx(1.0, abs=0.01)
+    assert u.tokens == pytest.approx(1.0, abs=0.01)
+
+
+async def test_allowed_request_consumes_all_layers():
+    """全部通过时四层统一各扣 1 令牌（原子扣减的正面控制）。"""
+    rl = RateLimiter(
+        rates={"model": 1.0, "endpoint": 1.0, "project": 1.0, "user": 1.0},
+        bucket_capacity=1.0,
+    )
+    m = await rl._bucket("m:m1", 1.0)
+    e = await rl._bucket("e:POST:/v1/x", 1.0)
+    p = await rl._bucket("p:p1", 1.0)
+    u = await rl._bucket("u:u1", 1.0)
+
+    ok, retry, layer = await rl.check(
+        model="m1", endpoint_key="POST:/v1/x", project_id="p1", user_id="u1"
+    )
+    assert ok
+    assert retry == 0.0
+    assert layer is None
+    assert m.tokens == pytest.approx(0.0, abs=0.05)
+    assert e.tokens == pytest.approx(0.0, abs=0.05)
+    assert p.tokens == pytest.approx(0.0, abs=0.05)
+    assert u.tokens == pytest.approx(0.0, abs=0.05)
+
+
+async def test_concurrent_check_serialized_no_over_consume():
+    """并发 check 在容量 1 的桶上严格串行：3 个并发仅 1 个放行（不超扣）。"""
+    rl = RateLimiter(rates={"user": 1.0}, bucket_capacity=1.0)
+    results = await asyncio.gather(
+        rl.check(user_id="u1"), rl.check(user_id="u1"), rl.check(user_id="u1")
+    )
+    allowed = sum(1 for r in results if r[0])
+    assert allowed == 1

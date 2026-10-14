@@ -64,8 +64,8 @@ def _chat_payload(model: str) -> dict[str, Any]:
     }
 
 
-def _sse_events(model: str, no_usage: bool = False) -> list[str]:
-    tokens = ["Hello", " ", "world"]
+def _sse_events(model: str, no_usage: bool = False, content: list[str] | None = None) -> list[str]:
+    tokens = content if content is not None else ["Hello", " ", "world"]
     events = []
     for t in tokens:
         events.append(
@@ -179,6 +179,12 @@ def build_mock_app() -> FastAPI:
             return StreamingResponse(_stream_slowstart(model), media_type="text/event-stream")
         if model == "slowstream":
             return StreamingResponse(_stream_slow(model), media_type="text/event-stream")
+        if model == "jsonstream":
+            # 流式输出合法 JSON（供流式结构化输出收尾校验 status=ok 用例）
+            return StreamingResponse(
+                iter(_sse_events(model, content=["{\"intent\": \"", "greeting\", \"items\": [\"a\", \"b\"]}"])),
+                media_type="text/event-stream",
+            )
         if model == "nousage":
             return StreamingResponse(
                 iter(_sse_events(model, no_usage=True)), media_type="text/event-stream"

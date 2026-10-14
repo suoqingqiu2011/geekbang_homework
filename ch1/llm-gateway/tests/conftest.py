@@ -75,7 +75,7 @@ def write_test_config(path: Path, mock_url: str, *, rate: dict[str, float] | Non
             "thinking_capability": 0.7,
             "capacity": 10,
             "timeout": 10.0,
-            "model_aliases": {"ok": "ok", "broken": "broken", "badjson": "badjson", "nousage": "nousage", "slowstream": "slowstream", "rf400": "rf400"},
+            "model_aliases": {"ok": "ok", "broken": "broken", "badjson": "badjson", "nousage": "nousage", "slowstream": "slowstream", "rf400": "rf400", "jsonstream": "jsonstream"},
         },
         "timeout": {
             "api_base_url": mock_url + "/v1",
@@ -105,6 +105,7 @@ def write_test_config(path: Path, mock_url: str, *, rate: dict[str, float] | Non
         {"name": "nousage", "provider": "ok", "routing_weight": 1.0},
         {"name": "slowstream", "provider": "ok", "routing_weight": 1.0},
         {"name": "rf400", "provider": "ok", "routing_weight": 1.0},
+        {"name": "jsonstream", "provider": "ok", "routing_weight": 1.0},
         {"name": "slow", "provider": "timeout", "routing_weight": 1.0},
         {"name": "claude-ok", "provider": "anthropic", "routing_weight": 1.0},
     ]

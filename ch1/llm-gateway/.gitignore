@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════════════
+# LLM Gateway — 仓库卫生：Secrets / 运行时产物 / 缓存一律不入库
+# ═══════════════════════════════════════════════════════════
+
+# --- 密钥与本地配置：.env 不入库，模板见 .env.example ---
+.env
+.env.*
+!.env.example
+
+# --- SQLite 运行时数据库（含 WAL/SHM 并发产物）---
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# --- Python 运行时缓存 ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- 虚拟环境与测试产物 ---
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

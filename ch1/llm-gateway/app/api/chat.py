@@ -295,6 +295,7 @@ async def _handle_stream(
         final_usage = None
         ttft: Optional[float] = None
         stream_chars = 0  # 已向客户端输出的字符数（半程观测）
+        content_parts: list[str] = []  # 累积 delta 内容（仅结构化输出流式收尾校验用；schema=None 不累积）
         partial_recorded = False  # 是否已固化"部分输出后失败"观测
         abort_candidate = False  # 是否应中止当前候选（失败=不再重试，转下一候选）
 
@@ -307,6 +308,7 @@ async def _handle_stream(
                 # 污染成功候选的归因（#4 修复）。
                 candidate_first_token = True
                 ttft = None
+                content_parts = []  # 候选级重置：失败候选残留内容不得污染成功候选的收尾校验
                 decision = await ctx.circuit.can_pass_request(ctx.store, candidate.provider)
                 if not decision.allowed:
                     continue
@@ -362,6 +364,8 @@ async def _handle_stream(
                                 stream_started = True
                                 if ev.delta:
                                     stream_chars += len(str(ev.delta))
+                                    if schema is not None:
+                                        content_parts.append(str(ev.delta))
                                 chunk: dict[str, Any] = {
                                     "id": _completion_id(trace.trace_id),
                                     "object": "chat.completion.chunk",
@@ -515,7 +519,36 @@ async def _handle_stream(
                     .update_metric("cost_usd", cost_usd) \
                     .update_metric("status", "success") \
                     .update_metric("attempts", attempts_total)
+
+                # ★ 流式结构化输出收尾校验：usage 汇总事件后对拼接内容做 validator 校验。
+                #   非流式路径在返回前校验+自动修复；流式内容已逐块透传客户端、无法自动修复，
+                #   故仅追加一个校验状态事件供客户端判断，并落 validation_failed 观测供审计。
+                #   schema=None（普通对话流）：不累积、不发校验事件，保持 OpenAI 兼容事件序列。
+                if schema is not None:
+                    verr: Optional[str] = None
+                    _data, verr = ctx.validator.validate_response(
+                        "".join(content_parts), schema
+                    )
+                    if verr is not None:
+                        trace.update_metric("validation_failed", True) \
+                             .update_metric("validation_error", verr)
+                        logger.warning(
+                            "Stream structured output failed post-hoc validation "
+                            "(trace=%s provider=%s error=%s)",
+                            trace.trace_id, success_provider, verr,
+                        )
                 await ctx.store.record_trace(trace.snapshot())
+                if schema is not None:
+                    yield _sse({
+                        "id": _completion_id(trace.trace_id),
+                        "object": "chat.completion.chunk",
+                        "created": int(trace.timestamp_us),
+                        "model": success_model,
+                        "type": "validation",
+                        "status": "ok" if verr is None else "error",
+                        "error": verr,
+                        "choices": [],
+                    })
                 yield _sse_done()
                 return
 
