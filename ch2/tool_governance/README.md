@@ -135,10 +135,41 @@ python tool_governance_demo.py --agent --input "请查询订单 ord_1001 的状�
 |---|---|---|
 | **参数校验** | Pydantic 严格类型 + 正则 + 范围约束，防注入 | `StrictArgs`、`TransferArgs`、`model_validate()` |
 | **权限状态机** | 9 级固定优先级决策引擎（deny → plan → whitelist → RBAC → precheck → approval → bypass → allow → default） | `PermissionEngine.decide()` |
-| **一次性审批** | 基于 SHA-256 摘要的参数绑定审批，TTL + used 标记，防重放 | `ApprovalStore.approve()` / `consume()` |
+| **一次性审批** | 基于 SHA-256 摘要的参数绑定审批，TTL + used 标记，防重放；时钟可注入（`ApprovalStore(clock=...)`，默认 `time.time`） | `ApprovalStore.approve()` / `consume()` |
 | **超时恢复** | `asyncio.timeout` 自动掐断执行，幂等读可重试，非幂等写报 `TIMEOUT_UNKNOWN` | `ToolRuntime._execute_with_recovery()` |
 | **结果脱敏** | 递归遍历返回 dict，对敏感 key、邮箱、账户号进行掩码 | `_redact()` |
 | **审计留痕** | 记录决策与执行两阶段日志（trace_id、decision、code、latency_ms） | `AuditSink.append()` |
+
+### 4.1 审批摘要的绑定语义（重要）
+
+`ApprovalStore` 的摘要由 `_approval_digest(tool_name, arguments)` 计算，且**显式剔除了 `idempotency_key`**。这带来一个需要明确的绑定语义：
+
+- **绑定的是“业务内容”，不是“请求身份”**：摘要 = `SHA-256(tool_name + 剔除 idempotency_key 后的规范化参数)`，即只锁定 `(from_account, to_account, amount)`，**不锁定本次请求的幂等键**。
+- **后果**：同一 `(from, to, amount)` 内容的审批，**可被任意 `idempotency_key` 的请求消费**。也就是说，审批约束的是“转多少、从哪到哪”，而不是“这是第几次提交”。
+- **与幂等键的分工（两者正交）**：
+  - **幂等键**（`idempotency_key` + `IDEMPOTENCY_STORE`）负责“同一逻辑意图只执行一次”，用于去重、防界面双击 / 重复提交；它是**请求身份**，不参与审批摘要，也不参与 `canonical_target`。
+  - **审批**负责“这次具体动作是否被授权”，是**内容绑定**的授权凭证。
+- **不会因此导致重复执行**：审批是“一次性”的（消费后置 `used=True`）且带 TTL，每个审批最多被消费一次。若同内容、不同键的两个请求竞争同一审批，**先消费者生效**，后到者会因审批已用而返回 `CONFIRM`（需重新审批）。
+
+> **如需更强的“请求级绑定”**（即：签发审批时若带幂等键，则消费时该键也必须参与匹配），可改为在 `_approval_digest` 中“仅当键存在时才将其纳入摘要”，并在 `ApprovalStore.consume` 增加幂等键一致性校验。当前实现选择“内容绑定”，以保证 `approve(dict)` 与 `consume(model)` 两条路径摘要一致（详见 `_approval_digest` 的代码注释）。
+
+### 4.2 可替换时钟（clock 注入）
+
+`ApprovalStore` 的时间源通过构造函数注入，便于测试在不改动模块全局状态的前提下模拟时间流逝：
+
+- **类型**：`Clock = Callable[[], float]`，即“无参、返回当前时间戳”的回调。
+- **默认值**：`ApprovalStore(clock=None)` 时回落到 `time.time`，生产路径无需显式传参。
+- **装配入口**：`build_runtime(clock=...)` 会把 clock 透传给内部 `ApprovalStore`，测试无需手工构造 store。
+- **典型用法**：注入一个读 `fake_now` dict 的闭包，然后修改 `fake_now["now"]` 即可“拨动时钟”越过 TTL（见 `test_transfer_approval_expires_after_ttl`）。
+
+```python
+fake_now = {"now": 1_000_000.0}
+runtime, approvals, _audit = demo.build_runtime(clock=lambda: fake_now["now"])
+approve(approvals, arguments)        # expires_at = fake_now + 300
+fake_now["now"] += 301               # 拨动时钟，越过 300s TTL
+```
+
+> 相比直接替换 `demo.time.time`：注入版的作用范围只限于该 `ApprovalStore` 实例，随对象回收自动消失，无需 `try/finally` 恢复全局函数，多测试并行也互不干扰。
 
 ---
 
@@ -375,6 +406,7 @@ py -3.14 -m pip install pydantic
 - **自定义脱敏规则**：在 `_redact()` 追加新的正则替换逻辑。
 - **持久化审计日志**：替换 `AuditSink` 的内存列表实现为数据库 sink，接口不变。
 - **并发安全**：引入 `asyncio.Lock` 保护 `ACCOUNTS` 读写，防止超卖。
+- **替换时钟实现**：`ApprovalStore` 已支持注入 clock，可平滑替换为 `time.monotonic`、NTP 或分布式时钟源，无需改动审批逻辑。
 
 ---
 

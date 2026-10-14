@@ -135,6 +135,7 @@ ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
 Handler = Callable[[str, ArgsModel, ExecutionContext], Awaitable[Mapping[str, Any]]]
 Precheck = Callable[[ArgsModel, ExecutionContext], Awaitable[None]]
 CanonicalTarget = Callable[[ArgsModel], str]
+Clock = Callable[[], float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +259,8 @@ def _stable_value(value: Any) -> Any:
 def _approval_digest(tool_name: str, arguments: ArgsModel | Mapping[str, Any]) -> str:
     # 幂等键是"请求的身份"，不是被批准的"业务内容"，故从审批摘要中剔除：
     # 这样 approve()（原始 dict）与 consume()（校验后 model）拿到一致的摘要，审批才能匹配。
+    # 绑定语义：摘要只锁定 (from_account, to_account, amount) 等业务内容，不锁定 idempotency_key；
+    # 因此同一内容的审批可被不同幂等键的请求消费（去重由 IDEMPOTENCY_STORE 承担，两者正交）。
     stable = _stable_value(arguments)
     if isinstance(stable, Mapping) and "idempotency_key" in stable:
         stable = {key: item for key, item in stable.items() if key != "idempotency_key"}
@@ -266,8 +269,10 @@ def _approval_digest(tool_name: str, arguments: ArgsModel | Mapping[str, Any]) -
 
 
 class ApprovalStore:
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         self._records: dict[str, ApprovalRecord] = {}
+        # 可替换时钟：默认 time.time；测试可注入可控 clock，无需改动模块全局状态。
+        self._clock: Clock = clock or time.time
 
     def approve(
         self,
@@ -284,7 +289,7 @@ class ApprovalStore:
             tenant_id=context.tenant_id,
             tool_name=tool_name,
             digest=_approval_digest(tool_name, arguments),
-            expires_at=time.time() + ttl_seconds,
+            expires_at=self._clock() + ttl_seconds,
         )
 
     def consume(
@@ -294,11 +299,14 @@ class ApprovalStore:
         tool_name: str,
         arguments: ArgsModel,
     ) -> bool:
+        # 绑定语义：摘要不含 idempotency_key（见 _approval_digest），审批只绑定业务内容
+        # (from, to, amount)，不绑定请求身份；同内容、不同幂等键的请求可共享同一审批，
+        # 但审批是一次性消费（used=True）+ TTL，先消费者生效，后到者返回 CONFIRM。
         record = self._records.get(approval_id or "")
         valid = bool(
             record
             and not record.used
-            and record.expires_at >= time.time()
+            and record.expires_at >= self._clock()
             and record.user_id == context.user_id
             and record.tenant_id == context.tenant_id
             and record.tool_name == tool_name
@@ -868,8 +876,9 @@ def build_runtime(
     approvals: ApprovalStore | None = None,
     audit: AuditSink | None = None,
     rules: Sequence[PermissionRule] = DEFAULT_RULES,
+    clock: Clock | None = None,
 ) -> tuple[ToolRuntime, ApprovalStore, AuditSink]:
-    approval_store = approvals or ApprovalStore()
+    approval_store = approvals or ApprovalStore(clock=clock)
     audit_sink = audit or AuditSink()
     engine = PermissionEngine(rules, approval_store)
     return ToolRuntime(build_tools(), engine, audit_sink), approval_store, audit_sink

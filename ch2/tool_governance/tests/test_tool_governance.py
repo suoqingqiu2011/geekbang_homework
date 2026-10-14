@@ -240,21 +240,18 @@ async def test_transfer_requires_approval_bound_to_arguments_and_masks_accounts(
 
 @async_test
 async def test_transfer_approval_expires_after_ttl() -> None:
-    """人工审批：审批有过期时间（TTL 300s），过期后即使参数一致也无法放行，回到 CONFIRM。"""
+    """人工审批：审批有过期时间（TTL 300s），过期后即使参数一致也无法放行，回到 CONFIRM。
 
-    runtime, approvals, _audit = demo.build_runtime()
+    通过给 ApprovalStore 注入可控 clock 拨动时间，不改动模块全局状态。
+    """
+
+    fake_now = {"now": 1_000_000.0}
+    runtime, approvals, _audit = demo.build_runtime(clock=lambda: fake_now["now"])
     arguments = {"from_account": FROM_ACCOUNT, "to_account": TO_ACCOUNT, "amount": 1_000.0}
 
-    # 用可控时钟替换 demo 模块里的 time.time，让审批签发后越过 TTL 再消费。
-    fake_time = {"now": 1_000_000.0}
-    original_time = demo.time.time
-    demo.time.time = lambda: fake_time["now"]
-    try:
-        approve(approvals, arguments)  # expires_at = now + 300
-        fake_time["now"] += 301  # 越过 300s TTL
-        expired = await transfer(runtime, "call_tr_expired", arguments, approval_id=APPROVAL_ID)
-    finally:
-        demo.time.time = original_time
+    approve(approvals, arguments)  # expires_at = now + 300
+    fake_now["now"] += 301  # 越过 300s TTL
+    expired = await transfer(runtime, "call_tr_expired", arguments, approval_id=APPROVAL_ID)
 
     assert expired.ok is False
     assert expired.action is demo.DecisionAction.CONFIRM
