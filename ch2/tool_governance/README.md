@@ -56,13 +56,7 @@ pip install pydantic pytest anyio
 
 ## 2. 项目结构
 
-```
-tool_governance/
-├── tool_governance_demo.py    # 核心框架 + transfer 工具实现
-├── conftest.py                # pytest 全局配置
-└── tests/
-    └── test_tool_governance.py  # 转账工具的验收测试
-```
+本项目位于 `ch2/tool_governance/`。完整的目录树统一收在文末 [附录：ch2 目录结构](#附录ch2-目录结构)，本文只说明各文件职责：
 
 ### 核心文件说明
 
@@ -407,6 +401,25 @@ py -3.14 -m pip install pydantic
 - **持久化审计日志**：替换 `AuditSink` 的内存列表实现为数据库 sink，接口不变。
 - **并发安全**：引入 `asyncio.Lock` 保护 `ACCOUNTS` 读写，防止超卖。
 - **替换时钟实现**：`ApprovalStore` 已支持注入 clock，可平滑替换为 `time.monotonic`、NTP 或分布式时钟源，无需改动审批逻辑。
+
+---
+
+## 附录：ch2 目录结构
+
+以下为 `c:\projet\homework\ch2` 的完整目录结构（已剔除 `.pytest_cache/`、`__pycache__/` 等生成缓存）：
+
+```
+ch2/
+├── docs/
+│   ├── SPEC.md                         # 第二章需求规格说明
+│   └── q2.md                           # 第二章实战作业要求
+└── tool_governance/                    # 工具治理演示框架
+    ├── README.md                       # 本文档（使用说明 + 测试指南）
+    ├── conftest.py                     # pytest 全局 fixture（含 isolated_accounts 账户隔离）
+    ├── tool_governance_demo.py         # 核心框架 + get_order / create_refund / run_shell / transfer 工具
+    └── tests/
+        └── test_tool_governance.py     # transfer 工具的 14 个验收测试
+```
 
 ---
 
