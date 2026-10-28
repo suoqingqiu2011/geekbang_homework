@@ -32,7 +32,7 @@ curl.exe http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-de
 ```bash
 # 1. 环境
 python -m venv .venv
-source .venv/bin/activate         # Linux/macOS 激活虚拟环境
+source .venv/Scripts/activate         # Linux/macOS 激活虚拟环境
 pip install -r requirements-dev.txt
 
 # 2. 配置（填入各 Provider Key；密钥不硬编码，均从环境变量读取）
@@ -41,7 +41,7 @@ export DEEPSEEK_API_KEY="sk-your-key"   # 或临时设置单个变量
 
 # 3. 启动（务必用虚拟环境解释器；系统 python 未装项目依赖，
 #    会报 ModuleNotFoundError: No module named 'dotenv'）
-.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+.venv/Scripts/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # 4. 冒烟
 curl http://127.0.0.1:8000/healthz
@@ -293,10 +293,10 @@ httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 **Linux / macOS（Bash）：**
 
 ```bash
-.venv/bin/python -m cli.gateway_cli summary
-.venv/bin/python -m cli.gateway_cli daily --days 7
-.venv/bin/python -m cli.gateway_cli traces --status error
-.venv/bin/python -m cli.gateway_cli circuit
+.venv/Scripts/python -m cli.gateway_cli summary
+.venv/Scripts/python -m cli.gateway_cli daily --days 7
+.venv/Scripts/python -m cli.gateway_cli traces --status error
+.venv/Scripts/python -m cli.gateway_cli circuit
 ```
 
 ### 模板管理（CLI）
@@ -327,10 +327,10 @@ httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 **Linux / macOS（Bash）：**
 
 ```bash
-.venv/bin/python -m cli.gateway_cli templates list
-.venv/bin/python -m cli.gateway_cli templates get tpl-greet --version 1
-.venv/bin/python -m cli.gateway_cli templates upsert --id tpl-greet --name greet --content "你是{{role}}助手"
-.venv/bin/python -m cli.gateway_cli templates delete tpl-greet
+.venv/Scripts/python -m cli.gateway_cli templates list
+.venv/Scripts/python -m cli.gateway_cli templates get tpl-greet --version 1
+.venv/Scripts/python -m cli.gateway_cli templates upsert --id tpl-greet --name greet --content "你是{{role}}助手"
+.venv/Scripts/python -m cli.gateway_cli templates delete tpl-greet
 ```
 
 对应 HTTP 端点见「调用示例 → 模板管理 HTTP 端点」。
