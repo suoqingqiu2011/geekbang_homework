@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guarded-coding-harness"
+version = "0.1.0"
+description = "Guarded Coding Harness built on smolagents ToolCallingAgent"
+requires-python = ">=3.10"
+dependencies = ["smolagents"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+    "audit",
+    "checkpoint",
+    "contracts",
+    "gate",
+    "harness",
+    "sandbox",
+    "state_store",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../smolagents/src"]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
