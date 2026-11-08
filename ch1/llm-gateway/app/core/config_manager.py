@@ -31,8 +31,7 @@ class ProviderConfig:
     api_key_env: str = ""
     # 向后兼容的单一均价字段：若 YAML 只写这一项，则 prompt/completion 两价都等于它；
     # 若显式写了 cost_prompt_per_million_tokens / cost_completion_per_million_tokens，
-    # 则这两个新字段优先，均价字段仅作为路由评分的粗略参考（用典型 prompt/completion
-    # 占比加权得出）。
+    # 则以这两个字段为准，单一均价字段被忽略（路由加权价同样由分价重算，不读取均价）。
     cost_per_million_tokens: float = 1.0
     cost_prompt_per_million_tokens: Optional[float] = None
     cost_completion_per_million_tokens: Optional[float] = None
@@ -43,6 +42,10 @@ class ProviderConfig:
     # 原生结构化输出能力：json_schema | json_object | none
     #（none 表示不支持 response_format，由适配器用提示约束兜底，如 Anthropic）
     structured_output: str = "json_object"
+    # 流式是否请求上游回传真实 usage（OpenAI stream_options.include_usage）。
+    # 少数兼容上游不认该参数会直接 400，可在 provider 配置中置 false 关闭；
+    # 适配器另有运行时 400 自动降级兜底（去掉参数重试一次）。
+    stream_usage: bool = True
 
     def resolve_effective_costs(self) -> tuple[float, float]:
         """返回 (cost_prompt_per_million, cost_completion_per_million)。
@@ -129,7 +132,18 @@ class AppConfig:
 
 
 def _get(d: dict, key: str, default: Any = None) -> Any:
-    return d.get(key, default) if d else default
+    # 显式 null（YAML 里写成 `key:`）按“未配置”处理，避免 float(None)/int(None)
+    # 让整次热更新失败（reload 会保留旧配置，表现为改文件却不生效）。
+    if not d:
+        return default
+    value = d.get(key, default)
+    return default if value is None else value
+
+
+def _opt_float(d: dict, key: str) -> Optional[float]:
+    """读取可选浮点配置：键缺失或值为 null 时返回 None。"""
+    value = _get(d, key)
+    return float(value) if value is not None else None
 
 
 class ConfigurationManager:
@@ -245,28 +259,36 @@ class ConfigurationManager:
         # providers
         cfg.providers = {}
         for name, p in (_get(raw, "providers", {}) or {}).items():
-            cfg.providers[name] = ProviderConfig(
+            provider_cfg = ProviderConfig(
                 name=str(name),
                 api_base_url=str(_get(p, "api_base_url", "")),
                 api_key_env=str(_get(p, "api_key_env", "")),
                 # 向后兼容：单一均价仍读取，若显式写了分价则优先使用
                 cost_per_million_tokens=float(_get(p, "cost_per_million_tokens", 1.0)),
-                cost_prompt_per_million_tokens=(
-                    float(p["cost_prompt_per_million_tokens"])
-                    if "cost_prompt_per_million_tokens" in (p or {})
-                    else None
-                ),
-                cost_completion_per_million_tokens=(
-                    float(p["cost_completion_per_million_tokens"])
-                    if "cost_completion_per_million_tokens" in (p or {})
-                    else None
-                ),
+                cost_prompt_per_million_tokens=_opt_float(p, "cost_prompt_per_million_tokens"),
+                cost_completion_per_million_tokens=_opt_float(p, "cost_completion_per_million_tokens"),
                 thinking_capability=float(_get(p, "thinking_capability", 0.5)),
                 capacity=int(_get(p, "capacity", 10)),
                 timeout=float(_get(p, "timeout", 60.0)),
                 model_aliases={str(k): str(v) for k, v in (_get(p, "model_aliases", {}) or {}).items()},
                 structured_output=str(_get(p, "structured_output", "json_object")),
+                stream_usage=bool(_get(p, "stream_usage", True)),
             )
+            if not any(
+                _get(p, k) is not None
+                for k in (
+                    "cost_per_million_tokens",
+                    "cost_prompt_per_million_tokens",
+                    "cost_completion_per_million_tokens",
+                )
+            ):
+                logger.warning(
+                    "Provider '%s' 未配置任何价格字段，按 $%.1f/M 计费；"
+                    "请补充 cost_per_million_tokens 或分价字段",
+                    name,
+                    provider_cfg.cost_per_million_tokens,
+                )
+            cfg.providers[name] = provider_cfg
 
         # available_models
         cfg.available_models = []

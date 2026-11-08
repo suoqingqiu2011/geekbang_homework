@@ -83,6 +83,10 @@ class OpenAICompatAdapter(BaseAdapter):
             "messages": messages,
             "stream": stream,
         }
+        if stream and self.provider.stream_usage:
+            # OpenAI 官方流式默认不回传 usage：显式要求末尾附带 usage 块，
+            # 否则网关只能按字符数估算 → estimated=True → 无法真实计费。
+            body["stream_options"] = {"include_usage": True}
         if temperature is not None:
             body["temperature"] = temperature
         if max_tokens is not None:
@@ -212,6 +216,11 @@ class OpenAICompatAdapter(BaseAdapter):
             frequency_penalty=frequency_penalty, seed=seed,
             response_format=response_format, stream=True,
         )
+        # 兼容降级：部分 OpenAI 兼容上游不认 stream_options（直接 400），
+        # 准备去掉该参数的重试请求体，首次 400 且尚未输出内容时降级重试一次。
+        fallback_body: Optional[dict[str, Any]] = None
+        if "stream_options" in body:
+            fallback_body = {k: v for k, v in body.items() if k != "stream_options"}
         headers = await self._headers()
         headers.update(self._trace_headers(trace_id))
 
@@ -220,41 +229,65 @@ class OpenAICompatAdapter(BaseAdapter):
         prompt_tokens = 0
         completion_tokens = 0
         usage_seen = False  # 是否收到过上游真实 usage（用于估算/完整标记）
+        emitted = False  # 是否已向上游客户端输出内容（决定能否安全降级重试）
 
         completed = False
         try:
-            async with client.stream("POST", self._endpoint, json=body, headers=headers) as resp:
-                await self._raise_for_status(resp)
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = (chunk.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    text = delta.get("content") or ""
-                    if text and ttft is None:
-                        ttft = (time.monotonic() - t0) * 1000.0
-                    if text:
-                        completion_tokens += len(text)
-                    finish = choice.get("finish_reason")
-                    usage_raw = chunk.get("usage")
-                    if usage_raw:
-                        usage_seen = True
-                        prompt_tokens = int(usage_raw.get("prompt_tokens", prompt_tokens))
-                        completion_tokens = int(usage_raw.get("completion_tokens", completion_tokens))
-                    if text or finish:
-                        yield StreamEvent(
-                            delta=text,
-                            finish_reason=finish,
-                            ttft_ms=ttft,
+            request_bodies = [body] if fallback_body is None else [body, fallback_body]
+            for attempt, request_body in enumerate(request_bodies):
+                try:
+                    async with client.stream(
+                        "POST", self._endpoint, json=request_body, headers=headers
+                    ) as resp:
+                        await self._raise_for_status(resp)
+                        async for line in resp.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            choice = (chunk.get("choices") or [{}])[0]
+                            delta = choice.get("delta") or {}
+                            text = delta.get("content") or ""
+                            if text and ttft is None:
+                                ttft = (time.monotonic() - t0) * 1000.0
+                            if text:
+                                completion_tokens += len(text)
+                            finish = choice.get("finish_reason")
+                            usage_raw = chunk.get("usage")
+                            if usage_raw:
+                                usage_seen = True
+                                prompt_tokens = int(usage_raw.get("prompt_tokens", prompt_tokens))
+                                completion_tokens = int(usage_raw.get("completion_tokens", completion_tokens))
+                            if text or finish:
+                                emitted = True
+                                yield StreamEvent(
+                                    delta=text,
+                                    finish_reason=finish,
+                                    ttft_ms=ttft,
+                                )
+                    completed = True
+                    break
+                except UpstreamError as exc:
+                    # 仅首次尝试、尚未输出内容时的 400 视为"上游不认 stream_options"，
+                    # 去掉该参数重试；已有输出或非 400 一律原样上抛（避免重复吐字）。
+                    if (
+                        exc.http_status == 400
+                        and attempt == 0
+                        and not emitted
+                        and fallback_body is not None
+                    ):
+                        logger.warning(
+                            "Upstream rejected stream_options (provider=%s), "
+                            "retrying without include_usage",
+                            self.provider.name,
                         )
-            completed = True
+                        continue
+                    raise
         except httpx.TimeoutException as exc:
             raise UpstreamTimeoutError(f"Upstream timeout ({self.provider.name}): {exc}") from exc
         except httpx.HTTPError as exc:

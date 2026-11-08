@@ -272,7 +272,7 @@ async def _handle_completion(
         )
 
     await ctx.store.record_usage(
-        billing_id=trace.trace_id,
+        billing_id=trace.billing_id,
         trace_id=trace.trace_id,
         provider=outcome.provider,
         model=outcome.model,
@@ -549,7 +549,7 @@ async def _handle_stream(
 
                 elapsed_ms = (time.monotonic() - t_start) * 1000.0
                 await ctx.store.record_usage(
-                    billing_id=trace.trace_id,
+                    billing_id=trace.billing_id,
                     trace_id=trace.trace_id,
                     provider=success_provider,
                     model=success_model or "",

@@ -133,6 +133,7 @@ def build_mock_app() -> FastAPI:
         _OPENAI_REQUESTS.append({
             "model": model,
             "stream": bool(body.get("stream", False)),
+            "stream_options": body.get("stream_options"),
             "x_trace_id": request.headers.get("x-trace-id"),
             "response_format": body.get("response_format"),
             "messages": body.get("messages"),
@@ -186,6 +187,16 @@ def build_mock_app() -> FastAPI:
                 media_type="text/event-stream",
             )
         if model == "nousage":
+            return StreamingResponse(
+                iter(_sse_events(model, no_usage=True)), media_type="text/event-stream"
+            )
+        if model == "streamopt400":
+            # 模拟不认 stream_options 的上游：带该参数即 400，去掉后正常流式返回
+            # （但不回传 usage，供兼容降级 + 估算标记测试）。
+            if body.get("stream_options"):
+                raise HTTPException(
+                    status_code=400, detail={"error": "unknown parameter: stream_options"}
+                )
             return StreamingResponse(
                 iter(_sse_events(model, no_usage=True)), media_type="text/event-stream"
             )

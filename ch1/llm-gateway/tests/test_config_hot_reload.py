@@ -51,6 +51,32 @@ async def test_reload_success(tmp_path):
     assert "p2" in cm.config.providers
 
 
+async def test_reload_tolerates_null_price_fields(tmp_path):
+    """显式空值（YAML `key:` / null）按“未配置”处理，不再让整次 reload 失败。"""
+    p = tmp_path / "c.yaml"
+    _write(p)
+    cm = ConfigurationManager(config_path=str(p))
+    await cm.reload()
+    v1 = cm.version
+
+    _write(p, providers={
+        "p1": {
+            "api_base_url": "http://p1/v1",
+            "cost_per_million_tokens": 2.0,
+            "cost_prompt_per_million_tokens": None,
+            "cost_completion_per_million_tokens": None,
+            "thinking_capability": None,
+            "capacity": 5,
+        }
+    })
+    ok = await cm.reload()
+    assert ok and cm.version == v1 + 1
+    prov = cm.config.providers["p1"]
+    # 分价为 null → 回退单一均价；其他 null 数值 → 取缺省
+    assert prov.resolve_effective_costs() == (2.0, 2.0)
+    assert prov.thinking_capability == 0.5
+
+
 async def test_reload_failure_keeps_old(tmp_path):
     p = tmp_path / "c.yaml"
     _write(p)

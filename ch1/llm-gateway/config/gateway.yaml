@@ -43,7 +43,7 @@ providers:
   deepseek:
     api_base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
-    # 单一均价（兼容字段）与 prompt/completion 分价并存，计费/预算/路由优先使用分价
+    # 单一均价仅作兼容回退；分价存在时，计费/预算/路由均以分价为准
     cost_per_million_tokens: 1.0
     cost_prompt_per_million_tokens: 0.5
     cost_completion_per_million_tokens: 2.0

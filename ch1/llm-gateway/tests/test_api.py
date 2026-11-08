@@ -266,7 +266,12 @@ async def test_budget_exceeded_recorded_in_trace(gateway):
 # ─────────────────────────────────────────────────────────────
 # 计费恰好一次 + 限流
 # ─────────────────────────────────────────────────────────────
-async def test_billing_idempotent_per_trace(gateway):
+async def test_billing_not_collapsed_by_client_trace_id(gateway):
+    """客户端重复传入同一 trace_id 不得折叠计费。
+
+    billing_id 由服务端生成，与客户端可控的 trace_id 解耦；否则复用 trace_id
+    会导致后续请求被 INSERT OR IGNORE 静默丢弃，可无限免费调用。
+    """
     ctx = gateway["ctx"]
     trace_id = "trace-billing-001"
     for _ in range(2):
@@ -275,10 +280,11 @@ async def test_billing_idempotent_per_trace(gateway):
         )
         assert r.status_code == 200
     cursor = await ctx.store._require_db().execute(  # noqa: SLF001
-        "SELECT COUNT(*) AS c FROM usage_metrics WHERE billing_id = ?", (trace_id,)
+        "SELECT billing_id FROM usage_metrics WHERE trace_id = ?", (trace_id,)
     )
-    row = await cursor.fetchone()
-    assert row["c"] == 1  # 恰好一次
+    rows = await cursor.fetchall()
+    assert len(rows) == 2  # 每个请求各计费一次
+    assert len({r["billing_id"] for r in rows}) == 2  # 幂等键互不相同
 
 
 async def test_rate_limit_429(monkeypatch, tmp_path, mock_url):

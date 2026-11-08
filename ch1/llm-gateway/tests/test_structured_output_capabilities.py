@@ -217,14 +217,18 @@ async def test_upstream_400_degrades_retry_stream(gateway):
     assert "data: [DONE]" in r.text
 
     reqs = take_openai_requests()
-    assert len(reqs) == 2
+    # 请求序列（流式）：(带 response_format + stream_options) 400
+    #   → 适配器探测性去掉 stream_options 重试（S2 兼容降级）
+    #   → 仍 400（response_format 不可用）→ chat 层去掉 response_format + 注入 schema → 成功
+    assert len(reqs) == 3
     assert reqs[0]["response_format"] is not None
-    assert reqs[1]["response_format"] is None
+    assert reqs[1]["response_format"] is not None and reqs[1]["stream_options"] is None
+    assert reqs[2]["response_format"] is None
     # ★ 修复回归断言（流式路径同源修复）：降级重试请求同样注入完整 schema
-    assert any("json" in str(m.get("content", "")).lower() for m in reqs[1]["messages"]), (
+    assert any("json" in str(m.get("content", "")).lower() for m in reqs[2]["messages"]), (
         "degraded retry must carry a json hint in messages"
     )
-    assert any('"intent"' in str(m.get("content", "")) for m in reqs[1]["messages"]), (
+    assert any('"intent"' in str(m.get("content", "")) for m in reqs[2]["messages"]), (
         "degraded retry must embed the full schema (field names) in messages"
     )
 

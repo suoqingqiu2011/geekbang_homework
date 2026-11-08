@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import OrderedDict
 from typing import Any, Optional
 
 from jsonschema import Draft7Validator, ValidationError
@@ -39,8 +40,11 @@ _BALANCED_PATTERNS = [
 class StructuredOutputValidator:
     """结构化输出校验与修复。"""
 
-    def __init__(self) -> None:
-        self._schema_cache: dict[str, Draft7Validator] = {}
+    def __init__(self, max_schema_cache: int = 256) -> None:
+        # schema 完全由客户端控制：必须限制缓存容量，否则持续注入唯一 schema
+        # 会让键/值无限堆积（内存 DoS）。与限流桶一致，按 LRU 淘汰最久未用。
+        self._max_schema_cache = max_schema_cache
+        self._schema_cache: "OrderedDict[str, Draft7Validator]" = OrderedDict()
 
     # ── Prompt 注入检测 ──────────────────────────────────────
     def check_prompt_injection(self, messages: list[dict[str, Any]]) -> None:
@@ -59,9 +63,15 @@ class StructuredOutputValidator:
     def _validator(self, schema: dict[str, Any]) -> Draft7Validator:
         key = json.dumps(schema, sort_keys=True, ensure_ascii=False)
         cached = self._schema_cache.get(key)
-        if cached is None:
-            cached = Draft7Validator(schema)
-            self._schema_cache[key] = cached
+        if cached is not None:
+            self._schema_cache.move_to_end(key)
+            return cached
+        cached = Draft7Validator(schema)
+        self._schema_cache[key] = cached
+        self._schema_cache.move_to_end(key)
+        if len(self._schema_cache) > self._max_schema_cache:
+            # 淘汰最久未使用的 schema，防恶意唯一 schema 撑爆内存
+            self._schema_cache.popitem(last=False)
         return cached
 
     def validate(self, content: str, schema: dict[str, Any]) -> tuple[Any, Optional[str]]:

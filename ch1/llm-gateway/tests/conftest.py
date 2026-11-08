@@ -174,7 +174,7 @@ def write_multi_provider_config(path: Path, mock_url: str) -> None:
             "capacity": 10,
             "timeout": 10.0,
             "structured_output": "json_schema",
-            "model_aliases": {"gpt-4o": "ok"},
+            "model_aliases": {"gpt-4o": "ok", "streamopt400": "streamopt400"},
         },
         "deepseek": {
             "api_base_url": mock_url + "/v1",
@@ -225,6 +225,7 @@ def write_multi_provider_config(path: Path, mock_url: str) -> None:
     }
     models = [
         {"name": "gpt-4o", "provider": "openai", "routing_weight": 1.0},
+        {"name": "streamopt400", "provider": "openai", "routing_weight": 1.0},
         {"name": "deepseek-chat", "provider": "deepseek", "routing_weight": 1.0},
         {"name": "kimi-k2", "provider": "kimi", "routing_weight": 1.0},
         {"name": "qwen-max", "provider": "qwen", "routing_weight": 1.0},

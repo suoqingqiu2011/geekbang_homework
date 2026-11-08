@@ -360,7 +360,7 @@ http://127.0.0.1:8000/ui/templates.html   # 等价（静态挂载）
 - 自检：文件首字节应为 `123`（即 `{`）。若是 `239` 开头，说明带了 BOM，会得到
   `400 {"detail":"There was an error parsing the body"}`。
 
-验证通过时，渲染预览应返回 `HTTP 200` 与 `{"template_id":"tpl-greet","rendered":"你是销售1号助手，请回答：报价策略"}`。
+验证通过时，渲染预览应返回 `HTTP 200` 与 `{"template_id":"tpl-greet","rendered":"你是销售助手，请回答：报价策略"}`。
 
 ```powershell
 # 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
@@ -565,6 +565,27 @@ curl -sS "http://localhost:8000/v1/admin/daily?days=7" -H "Authorization: Bearer
 ```
 
 超出上限的参数（如 `limit=99999`）会直接返回 `400 invalid_request`，不做静默截断。
+
+### 计费与定价（prompt/completion 分价）
+
+供应商支持按 prompt / completion 分别定价（两者单价通常相差数倍）：
+
+```yaml
+providers:
+  deepseek:
+    cost_prompt_per_million_tokens: 0.5
+    cost_completion_per_million_tokens: 2.0
+```
+
+- 配置了分价时，**计费、预算预检、路由加权价**均使用分价；只写 `cost_per_million_tokens`
+  （单一均价）时，两价回退为该值，兼容旧配置。
+- 单次成本 = `prompt_tokens/1e6 × prompt单价 + completion_tokens/1e6 × completion单价`，
+  落库到 `usage_metrics.cost_usd`，并累计进 `daily_aggregates`。
+- 三个价格字段全部缺失时会打印 warning 并按 `$1/M` 计费（避免静默按 0 计费）。
+- 上游未返回 usage 的请求按估算 token 记录，并标记 `estimated=1`、`cost_usd=0`，
+  因此日报成本可能偏低；精确账单以返回 usage 的请求为准。
+
+`daily`（CLI 与 `/v1/admin/daily`）已按 `prompt_tokens` / `completion_tokens` 分列累计。
 
 ## CLI 运维
 

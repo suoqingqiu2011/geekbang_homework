@@ -11,6 +11,8 @@ from typing import Any
 
 from app.storage.metrics_store import MetricsStore
 
+from .mock_upstream import take_openai_requests
+
 
 def _headers() -> dict[str, str]:
     return {"Authorization": "Bearer sk-test"}
@@ -91,6 +93,49 @@ async def test_stream_no_usage_char_count_is_estimated_in_db(gateway):
     assert row["estimated"] == 1
     assert row["complete"] == 0
     assert row["completion_tokens"] == len("Hello world")  # 字符数而非真实 token
+
+
+# ─────────────────────────────────────────────────────────────
+# ★ S2 修复：流式请求必须向上游索要真实 usage（stream_options.include_usage）
+#   否则 OpenAI 官方流式默认不回 usage → 一律估算 → 计费恒为 0。
+# ─────────────────────────────────────────────────────────────
+async def test_stream_request_asks_upstream_for_usage(multi_gateway):
+    take_openai_requests()
+    r = await multi_gateway["client"].post(
+        "/v1/chat/completions", json=_req("gpt-4o", stream=True), headers=_headers()
+    )
+    assert r.status_code == 200
+    captured = [c for c in take_openai_requests() if c["stream"]]
+    assert len(captured) == 1
+    # 请求体显式携带 stream_options={"include_usage": True}
+    assert captured[0]["stream_options"] == {"include_usage": True}
+    # 末尾 usage 块被正确回填 → 真实计费行（非估算）
+    row = await _usage_row(multi_gateway["ctx"].store._require_db())
+    assert row is not None
+    assert row["estimated"] == 0
+    assert row["complete"] == 1
+    assert row["completion_tokens"] == 3
+
+
+async def test_stream_degrades_when_upstream_rejects_stream_options(multi_gateway):
+    """上游不认 stream_options（400）→ 去掉该参数降级重试一次，请求仍成功。"""
+    take_openai_requests()
+    r = await multi_gateway["client"].post(
+        "/v1/chat/completions", json=_req("streamopt400", stream=True), headers=_headers()
+    )
+    assert r.status_code == 200
+    assert "Hello" in r.text and "data: [DONE]" in r.text
+    captured = [c for c in take_openai_requests() if c["stream"]]
+    # 首次带 stream_options → 400；降级后第二次不带该参数
+    assert len(captured) == 2
+    assert captured[0]["stream_options"] == {"include_usage": True}
+    assert captured[1]["stream_options"] is None
+    # 降级上游不回 usage：按字符数估算、标记不完整（不计费，符合既有语义）
+    row = await _usage_row(multi_gateway["ctx"].store._require_db())
+    assert row is not None
+    assert row["estimated"] == 1
+    assert row["complete"] == 0
+    assert row["completion_tokens"] == len("Hello world")
 
 
 # ─────────────────────────────────────────────────────────────

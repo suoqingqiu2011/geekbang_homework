@@ -23,6 +23,10 @@ class TraceFreezeRecord(BaseModel):
 
     # ── 创建时固化的快照 ────────────────────────────────────
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # 计费幂等键：必须服务端生成，不得复用客户端可控的 trace_id。
+    # 否则调用方重复传入同一 trace_id，会让后续请求被 INSERT OR IGNORE 静默丢弃，
+    # 导致漏计费、预算累计不增长（可无限免费调用）。
+    billing_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     timestamp_us: float = Field(default_factory=time.time)
     endpoint: str = "chat/completions"
     user_id: str = "anonymous"
