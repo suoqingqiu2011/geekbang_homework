@@ -34,8 +34,15 @@ class SharedHttpClientPool:
         self.read_timeout = read_timeout
         self._url_clients: dict[str, httpx.AsyncClient] = {}
         self._lock = asyncio.Lock()
+        self._initialized = False
+
+    @property
+    def initialized(self) -> bool:
+        """连接池是否已完成初始化（/readyz 就绪探测用）。"""
+        return self._initialized
 
     async def initialize(self) -> None:
+        self._initialized = True
         logger.info("HTTP Client Pool initialized (max=%d, keepalive=%d)",
                     self.max_connections, self.max_keepalive)
 

@@ -247,10 +247,11 @@ async def test_budget_exhausted(gateway):
 # ★ 缺陷C 回归：调用后按实际 token 用量核算，超预算记录观测
 # ─────────────────────────────────────────────────────────────
 async def test_budget_exceeded_recorded_in_trace(gateway):
-    """预检通过（est=10t×$3/M=$3e-5 ≤ 预算$4e-5），但上游实际返回 20 token
-    （实际 $6e-5 > 预算）→ 请求成功但 trace 记录 budget_exceeded 供审计。"""
+    """预检通过（1 prompt + 10 completion，分价 $41.5e-6 ≤ 预算 $4.5e-5），
+    但上游实际返回 12/8 token（分价 $5.0e-5 > 预算）→ 请求成功但 trace
+    记录 budget_exceeded 供审计。"""
     ctx = gateway["ctx"]
-    body = _req(trace_id="trace-over-budget", budget_usd=4e-5, max_tokens=10)
+    body = _req(trace_id="trace-over-budget", budget_usd=4.5e-5, max_tokens=10)
     r = await gateway["client"].post("/v1/chat/completions", json=body, headers=_headers())
     assert r.status_code == 200  # 内容已生成，不因超支而失败
     row = await (

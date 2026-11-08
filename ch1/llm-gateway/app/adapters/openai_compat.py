@@ -68,6 +68,13 @@ class OpenAICompatAdapter(BaseAdapter):
         *,
         temperature: Optional[float],
         max_tokens: Optional[int],
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
         response_format: Optional[dict[str, Any]],
         stream: bool,
     ) -> dict[str, Any]:
@@ -80,6 +87,20 @@ class OpenAICompatAdapter(BaseAdapter):
             body["temperature"] = temperature
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        if top_p is not None:
+            body["top_p"] = top_p
+        if stop:
+            body["stop"] = stop
+        if presence_penalty is not None:
+            body["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            body["frequency_penalty"] = frequency_penalty
+        if seed is not None:
+            body["seed"] = seed
+        if logprobs is not None:
+            body["logprobs"] = logprobs
+        if top_logprobs is not None:
+            body["top_logprobs"] = top_logprobs
         if response_format is not None:
             # OpenAI 兼容 response_format（structured output 约束）
             body["response_format"] = response_format
@@ -110,12 +131,22 @@ class OpenAICompatAdapter(BaseAdapter):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AdapterResult:
         client = await self.http_pool.get_client(self.provider.api_base_url)
         body = self._build_body(
             messages, model, temperature=temperature, max_tokens=max_tokens,
+            top_p=top_p, stop=stop, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, seed=seed,
+            logprobs=logprobs, top_logprobs=top_logprobs,
             response_format=response_format, stream=False,
         )
         t0 = time.monotonic()
@@ -155,6 +186,7 @@ class OpenAICompatAdapter(BaseAdapter):
             usage=usage,
             ttft_ms=latency_ms,  # 非流式视整体延迟为 TTFT 近似
             raw=data,
+            logprobs=choice.get("logprobs"),
         )
 
     # ── 流式 ─────────────────────────────────────────────────
@@ -165,12 +197,19 @@ class OpenAICompatAdapter(BaseAdapter):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AsyncIterator[StreamEvent]:
         client = await self.http_pool.get_client(self.provider.api_base_url)
         body = self._build_body(
             messages, model, temperature=temperature, max_tokens=max_tokens,
+            top_p=top_p, stop=stop, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, seed=seed,
             response_format=response_format, stream=True,
         )
         headers = await self._headers()

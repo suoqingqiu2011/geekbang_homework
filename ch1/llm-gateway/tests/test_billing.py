@@ -43,6 +43,10 @@ async def test_daily_aggregate_bumped(tmp_path):
         rows = await store.query_daily_aggregates(days=1)
         assert rows and rows[0]["requests"] == 2
         assert abs(rows[0]["cost_usd"] - 0.03) < 1e-9
+        # 分列累计：两次 10/5 → prompt 20 / completion 10 / total 30
+        assert rows[0]["prompt_tokens"] == 20
+        assert rows[0]["completion_tokens"] == 10
+        assert rows[0]["total_tokens"] == 30
     finally:
         await store.close()
 

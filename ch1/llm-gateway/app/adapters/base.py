@@ -37,6 +37,8 @@ class AdapterResult:
     usage: Usage = field(default_factory=Usage)
     ttft_ms: float = 0.0
     raw: Any = None
+    # 上游返回的 logprobs 原始结构（未请求时为 None）
+    logprobs: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -65,6 +67,13 @@ class BaseAdapter(ABC):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AdapterResult:
@@ -78,6 +87,11 @@ class BaseAdapter(ABC):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AsyncIterator[StreamEvent]:

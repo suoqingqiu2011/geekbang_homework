@@ -24,6 +24,8 @@ $env:DEEPSEEK_API_KEY = "sk-your-key"   # 或临时设置单个变量
 
 # 4. 冒烟
 curl.exe http://127.0.0.1:8000/healthz
+curl.exe http://127.0.0.1:8000/readyz
+curl.exe http://127.0.0.1:8000/metrics
 curl.exe http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 ```
 
@@ -45,12 +47,20 @@ export DEEPSEEK_API_KEY="sk-your-key"   # 或临时设置单个变量
 
 # 4. 冒烟
 curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/readyz
+curl http://127.0.0.1:8000/metrics
 curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 ```
 
 ## 调用示例
 
 ### 普通对话（非流式）
+
+> **`model` 为可选字段。** 省略时网关在**全部已配置 Key 的候选**里按「成本 + 思考能力」
+> 评分自动选路，**可能命中任意供应商**（如 qwen / kimi / anthropic），并非固定走
+> deepseek。响应体的 `model` 字段会回显实际命中的模型。需要固定供应商/模型时，
+> 请显式传 `model`，取值范围见 `config/gateway.yaml` 的 `available_models`
+> （如 `deepseek-chat`、`qwen-max`）。下方示例均显式指定 `model`，便于复现。
 
 **Windows（PowerShell）：** 多行命令用反引号 `` ` `` 续行；JSON Body 先写入临时文件再通过 `--data-binary` 发送（避免引号转义问题）。
 
@@ -64,14 +74,135 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS（Bash）：** 单引号包裹 JSON、`\` 续行，无需临时文件。
+**Linux / macOS / Git Bash：** 单引号包裹 JSON、`\` 续行，无需临时文件。
+`-sS` 静默进度但保留错误输出（连接失败时可看到 `Failed to connect`），
+`-i` 打印响应状态码与头（便于区分 401 invalid_auth / 200 OK 等）。
+网关准入 Key 必须是 `.env` 中 `GATEWAY_API_KEYS` 内的值，如 `sk-gateway-dev`
+（`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）。如需让测试 Key
+（如 `sk-test`）也可用，可在 `.env` 中追加后重启服务：
+`GATEWAY_API_KEYS=sk-gateway-dev,sk-gateway-test,sk-test`；生产环境不建议保留此类弱 Key (`sk-test`)。
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/chat/completions" \
-  -H "Authorization: Bearer sk-gateway-dev" \
+curl -sS -i http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"1+1=?"}],"stream":false}'
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
 ```
+
+不带 `model` 的自动选路对照（省略即交给网关决定）：
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+```
+
+响应体 `"model"` 即实际命中的模型名；需要固定时加回 `"model":"deepseek-chat"`。
+
+### 采样参数（top_p / stop / penalties / seed）
+
+除 `temperature` / `max_tokens` / `response_format` 外，请求体还支持以下**可选**采样参数。
+均可不传；**不传时上游请求体与改造前完全一致**（严格向后兼容）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `top_p` | float，0~1 | 核采样阈值 |
+| `stop` | string 或 string[] | 停止序列，最多 4 条、不可为空串 |
+| `presence_penalty` | float，-2~2 | 话题新鲜度惩罚 |
+| `frequency_penalty` | float，-2~2 | 词频惩罚 |
+| `seed` | integer | 尽力而为的可复现采样种子 |
+| `logprobs` | boolean | 返回 token 的对数概率（**仅非流式生效**） |
+| `top_logprobs` | integer，0~20 | 每个位置返回 top-N 候选；要求同时 `logprobs: true` |
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}],
+        "top_p":0.9,"stop":["END"],"presence_penalty":0.1,"frequency_penalty":0.2,"seed":42}'
+```
+
+> **供应商差异**：OpenAI 兼容供应商原样透传全部字段；Anthropic 仅支持 `top_p` 与
+> `stop`（映射为 `stop_sequences`，最多 4 条），`presence_penalty` /
+> `frequency_penalty` / `seed` / `logprobs` / `top_logprobs` 会被显式忽略
+> （仅记录 debug 日志，不返回错误）。
+>
+> `top_logprobs` 上限 20，且必须与 `logprobs: true` 同时使用，否则返回
+> `400 invalid_request`（与 OpenAI 行为一致，同时避免响应体积被放大）。
+> 未请求 logprobs 时，响应中仍保留 `choices[0].logprobs: null`（对齐 OpenAI 原生行为）。
+> 流式请求暂不支持 logprobs，传入会被忽略。
+>
+> 其余未声明字段（如 `tools`、`n`）仍按「忽略」处理而非报错，避免破坏既有客户端；
+> 因此这类参数**不会生效**，需要时请见「设计说明 → 后续升级方向」。
+
+### logprobs：用途、边界与使用案例
+
+`logprobs` 返回模型生成每个 token 时**采样前的条件概率**（对数形式）：
+`p = exp(logprob)`，越接近 0 越确定。它描述"模型有多确信"，**不描述"答案是否正确"**。
+
+**用途**
+
+| 用途 | 做法 |
+|---|---|
+| 置信度门控 | `exp(logprob)` 低于阈值 → 转人工 / 追问澄清 / 降级到 fallback 模型 |
+| 幻觉定位 | 找出低概率 token（通常落在数字、专有名词、日期处），按位置复核而非整段打回 |
+| 提示词歧义检测 | 看 `top_logprobs` 前二候选差距；`< 1.0 nat`（概率差 < 2.7 倍）说明模型在摇摆 |
+| 版本回归对比 | 同 prompt、同模型跨版本比较几何平均 logprob；**跨模型不可比**（tokenizer 切分不同） |
+
+**边界**
+
+- **高概率 ≠ 正确**：模型可以"自信地错"，不能替代 `response_format` 校验。
+- **条件概率**：整段 `sum(logprob)` 随长度变负，比较长短回答时要用几何平均 `exp(-sum/len)`。
+- **top-N 截断**：`top_logprobs` 只返回前 N 名，未列出的候选概率总和可能仍不小。
+- **协议限制**：仅非流式生效（流式传入会被忽略）；Anthropic 显式忽略并返回 `logprobs: null`；
+  部分 OpenAI 兼容供应商即便请求也不返回该字段，网关**原样透传、不伪造**。
+- **结构差异**：`logprobs.content` 数组长度 ≠ 字符串长度，首 token 常带前导空格。
+- **安全**：等于暴露模型输出分布（可用于蒸馏/提取），多租户对外时应纳入 Key 级能力白名单。
+
+**使用案例**
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Say hi"}],
+        "logprobs":true,"top_logprobs":3}'
+```
+
+响应中的关键片段：
+
+```json
+"choices": [{
+  "message": {"role": "assistant", "content": "Hi!"},
+  "logprobs": {"content": [
+    {"token": "Hi", "logprob": -0.002, "top_logprobs": [
+      {"token": "Hi", "logprob": -0.002},
+      {"token": "Hello", "logprob": -6.2}
+    ]}
+  ]}
+}]
+```
+
+消费侧判定（`logprobs` 为 `null` 表示上游未返回，不能当 0 处理）：
+
+```python
+import math
+
+lp = resp["choices"][0]["logprobs"]
+if lp:
+    items = lp["content"]
+    min_p = min(math.exp(t["logprob"]) for t in items)      # 最犹豫的 token
+    ppl = math.exp(-sum(t["logprob"] for t in items) / len(items))  # 跨长度可比的困惑度
+    if min_p < 0.5 or ppl < 0.6:
+        mark_for_review()          # 低置信 → 人工复核 / 转 fallback
+```
+
+| 指标 | 建议阈值 | 含义 |
+|---|---|---|
+| `min(exp(logprob))` | `< 0.5` 需复核 | 存在模型明显犹豫的 token |
+| 几何平均概率 | `< 0.6` 低置信 | 整段输出不稳定 |
+| 前二候选差距 | `< 1.0 nat` 有歧义 | 提示词可能含糊，而非模型能力问题 |
 
 ### 结构化输出（JSON Schema 校验 + 自动修复）
 
@@ -88,14 +219,19 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS（Bash）：**
+**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），
+规避 Windows Git Bash 把命令行参数中的中文按 GBK 编码、导致服务端 JSON 解析失败。
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/chat/completions" \
+curl -sS -X POST http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"解析用户意图"}],
-       "response_format":{"type":"json_schema","json_schema":{"name":"intent","schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}'
+  --data-binary @- <<'JSON'
+{"model":"deepseek-chat",
+ "messages":[{"role":"user","content":"解析用户意图"}],
+ "response_format":{"type":"json_schema","json_schema":{"name":"intent",
+   "schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}
+JSON
 ```
 
 ### 流式输出（Server-Sent Events）
@@ -105,7 +241,9 @@ curl -X POST "http://127.0.0.1:8000/v1/chat/completions" \
 ```powershell
 $json = '{"model":"deepseek-chat","messages":[{"role":"user","content":"数到5"}],"stream":true}'
 
-Set-Content -Path "$env:TEMP\req.json" -Value $json -Encoding UTF8 -NoNewline
+# PowerShell 5.1 的 -Encoding UTF8 会写入 BOM（非法 JSON 前导字节）；
+# 用 .NET 写成无 BOM 的 UTF-8，PS 5.1 / PS 7 行为一致
+[System.IO.File]::WriteAllText("$env:TEMP\req.json", $json, (New-Object System.Text.UTF8Encoding($false)))
 
 curl.exe -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   -H "Authorization: Bearer sk-gateway-dev" `
@@ -113,17 +251,70 @@ curl.exe -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS（Bash）：** `-N` 用于关闭缓冲，逐行输出 SSE 事件。
+**Linux / macOS / Git Bash：** `-N` 用于关闭缓冲，逐行输出 SSE 事件。body 走 stdin，
+避免中文参数被 shell 按 GBK 转码：
 
 ```bash
 curl -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"数到5"}],"stream":true}'
+  --data-binary @- <<'JSON'
+{"model":"deepseek-chat","messages":[{"role":"user","content":"数到5"}],"stream":true}
+JSON
 ```
+
+> **Windows Git Bash 必读**：不要写成 `-d '...中文...'`。中文 Windows 下该参数会按
+> GBK/CP936 传给 curl，服务端收到非法 UTF-8，在进入业务逻辑前就返回
+> `400 {"detail":"There was an error parsing the body"}`（与流式输出无关）。
+> 请使用上面的 stdin 写法，或先把 JSON 存为 UTF-8 文件再 `--data-binary @req.json`。
 
 响应为多条 `data: {...}` 事件，末行 `data: [DONE]` 表示结束。也可直接使用 Swagger UI
 交互式测试：浏览器打开 `http://127.0.0.1:8000/docs`。
+
+### 流式 + 结构化输出（validation 事件契约）
+
+当请求同时满足 `stream:true` 且携带 `response_format`（结构化输出）时，网关会在正常
+chunk 事件之后、`[DONE]` 之前追加**一条** `validation` 事件，供调用方判断整段流式输出
+是否通过 schema 校验。
+
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `type` | `"validation"` | 事件类型标识 |
+| `status` | `"ok"` \| `"error"` | 累积内容是否通过 schema 校验 |
+| `error` | `null` \| string | 失败时为 validator 的错误描述 |
+| `choices` | `[]` | 恒为空数组（非续写内容） |
+| `id` / `object` / `created` / `model` | 与其它 chunk 一致 | 便于按唯一 id 关联同一次请求 |
+
+事件序列（结构化输出流式）：
+
+```text
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"{\"intent\":"},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"\"buy\"}"},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","model":"deepseek-chat","type":"validation","status":"ok","error":null,"choices":[]}
+data: [DONE]
+```
+
+> 普通对话流（未携带 `response_format`）**不会**发送 `validation` 事件，事件序列与 OpenAI 官方一致。
+
+**语义与取舍：** 流式下 delta 已逐块透传给客户端，因此校验只能**事后进行、无法自动修复**；
+`status:"error"` 表示整段拼接内容不合 schema，调用方应丢弃本次结果或按业务重试。非流式路径
+则在返回前校验并尝试自动修复，失败会重试/fallback——两者行为不同，需分别处理。
+
+**示例（Bash / Git Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），
+避免 Windows 控制台把参数中的中文转成 GBK 导致服务端 JSON 解析失败。
+
+```bash
+curl -sS -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  --data-binary @- <<'JSON'
+{"model":"deepseek-chat",
+ "messages":[{"role":"user","content":"解析用户意图，返回 JSON"}],
+ "stream":true,
+ "response_format":{"type":"json_schema","json_schema":{"name":"intent",
+   "schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}
+JSON
+```
 
 ### 模板管理 HTTP 端点（/v1/templates）
 
@@ -153,21 +344,28 @@ http://127.0.0.1:8000/ui/templates        # 友好短路径
 http://127.0.0.1:8000/ui/templates.html   # 等价（静态挂载）
 ```
 
-页面顶部填入网关 API Key（`sk-test` 或当前合法 key）后点「保存并测试」，后续所有
-操作自动携带 `Authorization: Bearer ...` 头。Key 仅保存在浏览器 `localStorage`，
-数据操作仍受 `/v1/templates` 统一鉴权保护。HTML 本身可匿名访问，页面源码见
-`app/static/templates.html`。
+页面顶部填入网关 API Key（须为 `.env` 中 `GATEWAY_API_KEYS` 内的值，如
+`sk-gateway-dev`；`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）后点
+「保存并测试」，后续所有操作自动携带 `Authorization: Bearer ...` 头。Key 仅保存在
+浏览器 `localStorage`，数据操作仍受 `/v1/templates` 统一鉴权保护。HTML 本身可匿名
+访问，页面源码见 `app/static/templates.html`。
 
 ![模板管理页面示例](../docs/tpl_greet_1.png)
 
-**Windows（PowerShell）：** 与上方示例相同，先写临时文件再 `--data-binary` 发送。
-⚠️ 模板内容含中文时，临时文件须用 **UTF8** 编码（`-Encoding ascii` 会破坏中文），
-故此处用 `Set-Content ... -Encoding UTF8`。
+**Windows（PowerShell）：** 先写临时文件再 `--data-binary` 发送，**不受 Git Bash 的 GBK 传参问题影响**，
+因为正文不经过命令行参数；但文件必须是 **UTF-8 且不带 BOM**：
+
+- PS 5.1 的 `-Encoding UTF8` 会写 BOM（首字节 `239,187,191`），`-Encoding ascii` 会破坏中文；
+- 故统一用 `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))`（PS 7+ 也可用 `-Encoding utf8NoBOM`）；
+- 自检：文件首字节应为 `123`（即 `{`）。若是 `239` 开头，说明带了 BOM，会得到
+  `400 {"detail":"There was an error parsing the body"}`。
+
+验证通过时，渲染预览应返回 `HTTP 200` 与 `{"template_id":"tpl-greet","rendered":"你是销售1号助手，请回答：报价策略"}`。
 
 ```powershell
 # 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
 $json = '{"template_id":"tpl-greet","name":"greet","content":"你是{{role}}助手，请回答：{{question}}"}'
-Set-Content -Path "$env:TEMP\tpl.json" -Value $json -Encoding UTF8 -NoNewline
+[System.IO.File]::WriteAllText("$env:TEMP\tpl.json", $json, (New-Object System.Text.UTF8Encoding($false)))
 
 curl.exe -X POST "http://127.0.0.1:8000/v1/templates" `
   -H "Authorization: Bearer sk-gateway-dev" `
@@ -186,12 +384,21 @@ curl.exe http://127.0.0.1:8000/v1/templates/tpl-greet/versions -H "Authorization
 
 # 5) 渲染预览（不调用上游，适合调试模板）
 $json = '{"variables":{"role":"销售","question":"报价策略"}}'
-Set-Content -Path "$env:TEMP\render.json" -Value $json -Encoding UTF8 -NoNewline
+[System.IO.File]::WriteAllText("$env:TEMP\render.json", $json, (New-Object System.Text.UTF8Encoding($false)))
 
 curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
   -H "Authorization: Bearer sk-gateway-dev" `
   -H "Content-Type: application/json" `
   --data-binary "@$env:TEMP\render.json"
+
+# 5b) 排查接口本身（纯 ASCII 可直接用 -d，不依赖文件编码）
+curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
+  -H "Authorization: Bearer sk-gateway-dev" `
+  -H "Content-Type: application/json" `
+  -d '{\"variables\":{\"role\":\"sales\",\"question\":\"pricing\"}}'
+
+# 5c) 清理临时文件
+Remove-Item "$env:TEMP\tpl.json","$env:TEMP\render.json" -ErrorAction SilentlyContinue
 
 # 6) 删除（?version=1 删指定版本；缺省删全部）
 curl.exe -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" `
@@ -199,26 +406,39 @@ curl.exe -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" `
 curl.exe -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-**Linux / macOS（Bash）：** 单引号包裹 JSON 天然无转义问题，无需临时文件。
+**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin。
+若在 **Windows Git Bash** 中直接把中文写进 `-d '...'`，命令行参数会被按 GBK 编码传入，
+服务端收到非 UTF-8 字节 → `400 {"detail":"There was an error parsing the body"}`。
 
 ```bash
 # 创建/更新
 curl -X POST "http://127.0.0.1:8000/v1/templates" \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
-  -d '{"template_id":"tpl-greet","name":"greet","content":"你是{{role}}助手，请回答：{{question}}"}'
+  --data-binary @- <<'JSON'
+{"template_id":"tpl-greet","name":"greet","content":"你是{{role}}助手，请回答：{{question}}"}
+JSON
+```
 
+```bash
 # 渲染预览
 curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
-  -d '{"variables":{"role":"销售","question":"报价策略"}}'
+  --data-binary @- <<'JSON'
+{"variables":{"role":"销售","question":"报价策略"}}
+JSON
+```
 
-# 列出 / 查询 / 删除
+```bash
+# 列出 / 查询 / 删除（无 body，不受编码影响）
 curl http://127.0.0.1:8000/v1/templates -H "Authorization: Bearer sk-gateway-dev"
 curl "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorization: Bearer sk-gateway-dev"
 curl -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorization: Bearer sk-gateway-dev"
 ```
+
+> 纯 ASCII 的 body（如 `{"variables":{"role":"sales"}}`）用 `-d '...'` 在 Git Bash 中可直接使用；
+> 含中文时统一改用 `--data-binary @- <<'JSON'` 或临时文件方式。
 
 聊天中引用模板：在 `POST /v1/chat/completions` 请求体中通过扩展字段
 `template_id` / `template_version`（缺省最新）/ `template_vars` 注入，渲染结果作为
@@ -276,6 +496,75 @@ LLM 上游服务（`tests/mock_upstream.py`），并为每个用例创建指向�
 ```python
 httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 ```
+
+### 常见问题：`{"detail":"There was an error parsing the body"}`
+
+该 400 由 FastAPI 解析 body 阶段抛出，说明服务端收到的**不是合法 UTF-8 JSON**，
+与鉴权、schema 无关（因此不会返回 `invalid_auth` / `invalid_request`）。
+最常见原因：在中文 Windows 的 Git Bash / PowerShell 里用 `curl -d '...中文...'`，
+命令行参数被按 ANSI 代码页（GBK/CP936）传给 curl，body 变成非法 UTF-8。
+
+规避方式（任选其一）：
+
+1. body 走 stdin：`curl ... --data-binary @- <<'JSON' ... JSON`（推荐，见上方示例）；
+2. 先把 JSON 写成**无 BOM 的 UTF-8** 文件，再 `--data-binary @req.json`（PS 5.1 的 `-Encoding UTF8` 会带 BOM，推荐用 .NET `WriteAllText`）；
+3. 控制台切 UTF-8 代码页（`chcp.com 65001`），或示例内容改用 ASCII。
+
+## 可观测性与健康检查
+
+网关提供三个运维端点，均**无需鉴权、低成本**（`/metrics` 不进入 OpenAPI schema）：
+
+| 端点 | 语义 | 返回 |
+|---|---|---|
+| `GET /healthz` | **存活**探针：只证明进程在运行，不访问任何依赖 | `200` + `config_version` / `providers` |
+| `GET /readyz` | **就绪**探针：校验配置已加载、SQLite 可读写、连接池已初始化 | `200` / `503` + 逐项 `checks` |
+| `GET /metrics` | Prometheus 文本格式指标 | `text/plain; version=0.0.4` |
+
+两者分工：容器 `HEALTHCHECK` 用 `/healthz`（避免 SQLite 抖动误杀容器）；负载均衡 /
+外部探针用 `/readyz`。Provider 缺 Key 只在 `providers.missing_key` 中降级提示，
+**不判定为 503**（属配置问题而非进程故障）。
+
+```bash
+curl -sS http://localhost:8000/readyz
+# {"status":"ok","checks":{"config":{"ok":true,"version":1},"storage":{"ok":true},
+#  "http_pool":{"ok":true},"providers":{"ok":false,"missing_key":["openai"]}}}
+
+curl -sS http://localhost:8000/metrics
+```
+
+暴露的指标：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `llm_gateway_requests_total{endpoint,status}` | counter | 请求量；`status` 为 `success` 或错误码（如 `rate_limit_exceeded`） |
+| `llm_gateway_request_duration_seconds_sum/_count{endpoint}` | summary | 处理耗时；流式请求记录「直到响应开始」的耗时 |
+| `llm_gateway_rate_limit_rejected_total` | counter | 被限流拒绝的请求数 |
+| `llm_gateway_upstream_attempts_total` | counter | 上游调用尝试次数（含重试与降级） |
+| `llm_gateway_config_version` | gauge | 当前生效的配置版本号 |
+| `llm_gateway_uptime_seconds` | gauge | 进程运行时长 |
+| `llm_gateway_build_info{version}` | gauge | 构建版本（恒为 1） |
+
+> 指标为**每进程视角**：多 worker 部署时各 worker 独立计数，`/metrics` 每次只命中单个
+> worker；跨进程的精确历史数据仍以 SQLite（`usage_metrics` / `daily_aggregates`）与 CLI 为准。
+
+### 指标只读查询端点（/v1/admin）
+
+与 CLI 查询同一份 SQLite 数据，但可被脚本/看板直接调用。**需要 Bearer 鉴权**，
+纯只读，查询规模有硬上限，不提供任何写操作。
+
+| 端点 | 说明 | 关键参数 |
+|---|---|---|
+| `GET /v1/admin/summary` | 累计概览（请求数 / token / 成本 / 平均时延 / 错误数） | — |
+| `GET /v1/admin/traces` | 最近追踪记录（不含 prompt/response 原文） | `limit`(1~200，默认 20)、`status` |
+| `GET /v1/admin/daily` | 按天聚合的用量与成本 | `days`(1~90，默认 7)、`provider` |
+
+```bash
+curl -sS http://localhost:8000/v1/admin/summary -H "Authorization: Bearer sk-gateway-dev"
+curl -sS "http://localhost:8000/v1/admin/traces?limit=10&status=error" -H "Authorization: Bearer sk-gateway-dev"
+curl -sS "http://localhost:8000/v1/admin/daily?days=7" -H "Authorization: Bearer sk-gateway-dev"
+```
+
+超出上限的参数（如 `limit=99999`）会直接返回 `400 invalid_request`，不做静默截断。
 
 ## CLI 运维
 
@@ -426,11 +715,12 @@ errors             16
 app/
   api/chat.py          # /v1/chat/completions 管道
   api/templates.py     # /v1/templates 模板管理 HTTP 端点
+  api/admin.py         # /v1/admin 指标只读查询端点（summary/traces/daily）
   static/templates.html# /ui/templates 单文件模板管理页
-  core/                # 鉴权/限流/路由/熔断/取消/连接池/渲染/校验/配置
+  core/                # 鉴权/限流/路由/熔断/取消/连接池/渲染/校验/配置/指标
   adapters/            # openai-compat / anthropic 适配器 + 注册表
   storage/             # MetricsStore（SQLite WAL + 幂等计费）
-  main.py              # FastAPI 入口 + 生命周期 + 配置热更新
+  main.py              # FastAPI 入口 + 生命周期 + 配置热更新 + /healthz /readyz /metrics
 cli/gateway_cli.py     # 运维查询 CLI
 config/gateway.yaml    # 配置（支持热更新）
 docker/                # Dockerfile（H3 待评审）

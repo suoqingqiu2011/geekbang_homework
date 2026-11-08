@@ -43,7 +43,10 @@ providers:
   deepseek:
     api_base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
+    # 单一均价（兼容字段）与 prompt/completion 分价并存，计费/预算/路由优先使用分价
     cost_per_million_tokens: 1.0
+    cost_prompt_per_million_tokens: 0.5
+    cost_completion_per_million_tokens: 2.0
     thinking_capability: 0.8
     capacity: 10
     timeout: 60.0
@@ -55,6 +58,8 @@ providers:
     api_base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
     cost_per_million_tokens: 10.0
+    cost_prompt_per_million_tokens: 2.5
+    cost_completion_per_million_tokens: 10.0
     thinking_capability: 0.9
     capacity: 10
     timeout: 60.0
@@ -66,6 +71,8 @@ providers:
     api_base_url: https://api.moonshot.cn/v1
     api_key_env: KIMI_API_KEY
     cost_per_million_tokens: 2.0
+    cost_prompt_per_million_tokens: 1.0
+    cost_completion_per_million_tokens: 3.5
     thinking_capability: 0.85
     capacity: 10
     timeout: 60.0
@@ -77,6 +84,8 @@ providers:
     api_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key_env: QWEN_API_KEY
     cost_per_million_tokens: 1.5
+    cost_prompt_per_million_tokens: 0.8
+    cost_completion_per_million_tokens: 3.0
     thinking_capability: 0.75
     capacity: 10
     timeout: 60.0
@@ -88,6 +97,8 @@ providers:
     api_base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     cost_per_million_tokens: 15.0
+    cost_prompt_per_million_tokens: 3.0
+    cost_completion_per_million_tokens: 15.0
     thinking_capability: 0.95
     capacity: 5
     timeout: 60.0
@@ -98,6 +109,8 @@ providers:
     api_base_url: http://localhost:11434/v1
     # 本地服务无鉴权：不配置 api_key_env（避免无 Key 时构造非法空 Authorization 头）
     cost_per_million_tokens: 0.0
+    cost_prompt_per_million_tokens: 0.0
+    cost_completion_per_million_tokens: 0.0
     thinking_capability: 0.4
     capacity: 3
     timeout: 120.0
@@ -110,6 +123,9 @@ available_models:
   - name: deepseek-chat
     provider: deepseek
     routing_weight: 1.0
+    # 可选：上下文窗口软过滤（省略或 0 = 不限制）。
+    # 估算 prompt+max_tokens 超过该值的候选会被跳过；若全部候选超限则回退到全量候选。
+    # context_window: 65536
   - name: deepseek-reasoner
     provider: deepseek
     routing_weight: 0.9

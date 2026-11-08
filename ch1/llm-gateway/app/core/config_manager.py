@@ -29,7 +29,13 @@ class ProviderConfig:
     name: str
     api_base_url: str
     api_key_env: str = ""
+    # 向后兼容的单一均价字段：若 YAML 只写这一项，则 prompt/completion 两价都等于它；
+    # 若显式写了 cost_prompt_per_million_tokens / cost_completion_per_million_tokens，
+    # 则这两个新字段优先，均价字段仅作为路由评分的粗略参考（用典型 prompt/completion
+    # 占比加权得出）。
     cost_per_million_tokens: float = 1.0
+    cost_prompt_per_million_tokens: Optional[float] = None
+    cost_completion_per_million_tokens: Optional[float] = None
     thinking_capability: float = 0.5
     capacity: int = 10
     timeout: float = 60.0
@@ -37,6 +43,19 @@ class ProviderConfig:
     # 原生结构化输出能力：json_schema | json_object | none
     #（none 表示不支持 response_format，由适配器用提示约束兜底，如 Anthropic）
     structured_output: str = "json_object"
+
+    def resolve_effective_costs(self) -> tuple[float, float]:
+        """返回 (cost_prompt_per_million, cost_completion_per_million)。
+
+        优先使用显式分价；若都未配置则回退到单一均价。
+        """
+        prompt = self.cost_prompt_per_million_tokens
+        completion = self.cost_completion_per_million_tokens
+        if prompt is None:
+            prompt = self.cost_per_million_tokens
+        if completion is None:
+            completion = self.cost_per_million_tokens
+        return float(prompt), float(completion)
 
     def resolve_api_key(self) -> str:
         """从环境变量动态解析 API Key（支持后续轮换，H4）。"""
@@ -85,6 +104,8 @@ class ModelEntry:
     name: str
     provider: str
     routing_weight: float = 1.0
+    # 0 = 不限制（默认关闭，行为与改造前完全一致）
+    context_window: int = 0
 
 
 @dataclass
@@ -228,7 +249,18 @@ class ConfigurationManager:
                 name=str(name),
                 api_base_url=str(_get(p, "api_base_url", "")),
                 api_key_env=str(_get(p, "api_key_env", "")),
+                # 向后兼容：单一均价仍读取，若显式写了分价则优先使用
                 cost_per_million_tokens=float(_get(p, "cost_per_million_tokens", 1.0)),
+                cost_prompt_per_million_tokens=(
+                    float(p["cost_prompt_per_million_tokens"])
+                    if "cost_prompt_per_million_tokens" in (p or {})
+                    else None
+                ),
+                cost_completion_per_million_tokens=(
+                    float(p["cost_completion_per_million_tokens"])
+                    if "cost_completion_per_million_tokens" in (p or {})
+                    else None
+                ),
                 thinking_capability=float(_get(p, "thinking_capability", 0.5)),
                 capacity=int(_get(p, "capacity", 10)),
                 timeout=float(_get(p, "timeout", 60.0)),
@@ -245,6 +277,7 @@ class ConfigurationManager:
                         name=str(m["name"]),
                         provider=str(m["provider"]),
                         routing_weight=float(_get(m, "routing_weight", 1.0)),
+                        context_window=int(_get(m, "context_window", 0) or 0),
                     )
                 )
 

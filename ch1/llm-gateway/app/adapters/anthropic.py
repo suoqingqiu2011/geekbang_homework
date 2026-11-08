@@ -95,6 +95,11 @@ class AnthropicAdapter(BaseAdapter):
         *,
         temperature: Optional[float],
         max_tokens: Optional[int],
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         response_format: Optional[dict[str, Any]],
         stream: bool,
     ) -> dict[str, Any]:
@@ -109,6 +114,17 @@ class AnthropicAdapter(BaseAdapter):
             body["system"] = system
         if temperature is not None:
             body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
+        if stop:
+            # Anthropic 用 stop_sequences，且上限为 4 条
+            seqs = [stop] if isinstance(stop, str) else list(stop)
+            body["stop_sequences"] = seqs[:4]
+        if presence_penalty is not None or frequency_penalty is not None or seed is not None:
+            # Anthropic 协议无对应字段：显式忽略而非透传，避免上游 400
+            logger.debug(
+                "Anthropic does not support presence_penalty/frequency_penalty/seed; ignored"
+            )
         if response_format is not None:
             # Anthropic 不支持原生 response_format，使用提示约束（网关侧仍会校验）
             schema_hint = response_format.get("json_schema", {}).get("name", "json")
@@ -125,12 +141,25 @@ class AnthropicAdapter(BaseAdapter):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+        logprobs: Optional[bool] = None,
+        top_logprobs: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AdapterResult:
         client = await self.http_pool.get_client(self.provider.api_base_url)
+        if logprobs is not None or top_logprobs is not None:
+            # Anthropic 协议无 logprobs 字段：显式忽略（网关仍返回 logprobs=null），
+            # 不透传以避免上游 400。
+            logger.debug("Anthropic does not support logprobs/top_logprobs; ignored")
         body = self._build_body(
             messages, model, temperature=temperature, max_tokens=max_tokens,
+            top_p=top_p, stop=stop, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, seed=seed,
             response_format=response_format, stream=False,
         )
         t0 = time.monotonic()
@@ -173,12 +202,19 @@ class AnthropicAdapter(BaseAdapter):
         *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[str | list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
         response_format: Optional[dict[str, Any]] = None,
         trace_id: str = "",
     ) -> AsyncIterator[StreamEvent]:
         client = await self.http_pool.get_client(self.provider.api_base_url)
         body = self._build_body(
             messages, model, temperature=temperature, max_tokens=max_tokens,
+            top_p=top_p, stop=stop, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, seed=seed,
             response_format=response_format, stream=True,
         )
         t0 = time.monotonic()

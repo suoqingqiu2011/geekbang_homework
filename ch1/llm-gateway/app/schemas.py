@@ -37,6 +37,16 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     response_format: Optional[ResponseFormat] = None
 
+    # ── 采样参数（OpenAI 兼容子集，均可不传；不传时上游行为不变）───────
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    stop: Optional[str | list[str]] = None
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    seed: Optional[int] = None
+    # logprobs 仅非流式生效；top_logprobs 上限对齐 OpenAI(0~20)，防止响应体积被放大
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
+
     # ── 网关扩展字段 ────────────────────────────────────────
     user: str = "anonymous"
     project: str = "default"
@@ -53,7 +63,22 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("template_vars required when template_id is set")
         if self.template_version is not None and self.template_id is None:
             raise ValueError("template_id required when template_version is set")
+        if self.top_logprobs is not None and not self.logprobs:
+            raise ValueError("logprobs must be true when top_logprobs is set")
         return self
+
+    @field_validator("stop")
+    @classmethod
+    def _stop_sequences(cls, v: Optional[str | list[str]]) -> Optional[str | list[str]]:
+        """stop 支持字符串或字符串数组，数组上限 4（与 OpenAI/Anthropic 一致）。"""
+        if v is None:
+            return v
+        seqs = [v] if isinstance(v, str) else list(v)
+        if len(seqs) > 4:
+            raise ValueError("stop supports at most 4 sequences")
+        if any(not seq for seq in seqs):
+            raise ValueError("stop sequences must be non-empty strings")
+        return v
 
     @field_validator("messages")
     @classmethod
@@ -77,6 +102,8 @@ class ChoiceOut(BaseModel):
     index: int = 0
     message: dict[str, Any]
     finish_reason: str = "stop"
+    # 未请求 logprobs 时为 None（与 OpenAI 原生行为一致：该字段始终存在）
+    logprobs: Optional[dict[str, Any]] = None
 
 
 class ChatCompletionResponse(BaseModel):

@@ -72,6 +72,9 @@ def write_test_config(path: Path, mock_url: str, *, rate: dict[str, float] | Non
             "api_base_url": mock_url + "/v1",
             "api_key_env": "MOCK_KEY",
             "cost_per_million_tokens": 3.0,
+            # 分价：0.4*1.5 + 0.6*4.0 = 3.0，加权均价与单一均价一致，避免改变既有路由排序
+            "cost_prompt_per_million_tokens": 1.5,
+            "cost_completion_per_million_tokens": 4.0,
             "thinking_capability": 0.7,
             "capacity": 10,
             "timeout": 10.0,

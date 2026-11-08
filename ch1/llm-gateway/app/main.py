@@ -19,10 +19,11 @@ from typing import AsyncIterator, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from watchfiles import Change, awatch
 
+from .api.admin import router as admin_router
 from .api.chat import router as chat_router
 from .api.templates import router as templates_router
 from .context import AppContext
@@ -31,6 +32,7 @@ from .core.cancellation import CancellationHandler
 from .core.circuit_breaker import CircuitBreakerManager
 from .core.config_manager import ConfigurationManager
 from .core.http_client_pool import SharedHttpClientPool
+from .core.metrics_collector import GatewayMetrics
 from .core.prompt_renderer import PromptRenderer
 from .core.rate_limiter import RateLimiter
 from .core.retry_fallback import RetryFallbackManager
@@ -91,6 +93,7 @@ def _build_context(cfg_mgr: ConfigurationManager) -> AppContext:
         validator=StructuredOutputValidator(),
         prompt_renderer=PromptRenderer(store),
         cancellation=CancellationHandler(),
+        metrics=GatewayMetrics(),
     )
 
 
@@ -183,6 +186,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(chat_router)
     app.include_router(templates_router)
+    app.include_router(admin_router)
 
     # ── 静态资源 + 模板管理页面 ────────────────────────────
     static_dir = Path(__file__).resolve().parent / "static"
@@ -203,6 +207,52 @@ def create_app() -> FastAPI:
             "config_version": ctx.config_manager.version,
             "providers": list(ctx.config_manager.config.providers.keys()),
         }
+
+    @app.get("/readyz", tags=["ops"])
+    async def readyz(request: Request) -> JSONResponse:
+        """就绪探测：校验运行期依赖（配置 / SQLite / 连接池）。
+
+        与 /healthz 的分工：
+        - /healthz 仅证明进程存活（供容器 HEALTHCHECK 使用，避免 DB 抖动误杀容器）；
+        - /readyz 证明可对外服务，依赖不可用时返回 503。
+        Provider 缺少 Key 只做降级提示，不判定为不可用（属配置问题而非进程故障）。
+        """
+        ctx: AppContext = request.app.state.ctx
+        cfg = ctx.config_manager.config
+        checks: dict[str, dict] = {}
+        ready = True
+
+        checks["config"] = {"ok": cfg.loaded, "version": ctx.config_manager.version}
+        ready = ready and cfg.loaded
+
+        try:
+            await ctx.store.ping()
+            checks["storage"] = {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            checks["storage"] = {"ok": False, "reason": str(exc)}
+            ready = False
+
+        checks["http_pool"] = {"ok": ctx.http_pool.initialized}
+
+        missing = sorted(
+            name for name, provider in cfg.providers.items()
+            if provider.api_key_env and not provider.has_api_key()
+        )
+        checks["providers"] = {"ok": not missing, "missing_key": missing}
+
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ok" if ready else "not_ready", "checks": checks},
+        )
+
+    @app.get("/metrics", tags=["ops"], include_in_schema=False)
+    async def metrics(request: Request) -> Response:
+        """Prometheus 文本格式指标（进程内视角，无第三方客户端依赖）。"""
+        ctx: AppContext = request.app.state.ctx
+        return Response(
+            content=ctx.metrics.render(config_version=ctx.config_manager.version),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     # ── 全局异常处理 ────────────────────────────────────────
     @app.exception_handler(GatewayError)

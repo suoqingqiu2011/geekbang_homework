@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS daily_aggregates (
     model        TEXT NOT NULL,
     requests     INTEGER NOT NULL DEFAULT 0,
     errors       INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd     REAL NOT NULL DEFAULT 0.0,
     total_latency_ms REAL NOT NULL DEFAULT 0.0,
@@ -130,6 +132,7 @@ class MetricsStore:
         await self._db.executescript(_TABLES)
         await self._migrate_prompt_templates_if_needed()
         await self._migrate_usage_columns_if_needed()
+        await self._migrate_daily_aggregates_if_needed()
         await self._db.commit()
         logger.info("MetricsStore initialized: %s", self.db_path)
 
@@ -142,6 +145,13 @@ class MetricsStore:
         if self._db is None:
             raise RuntimeError("MetricsStore.initialize() must be called first")
         return self._db
+
+    # ── 就绪探测 ─────────────────────────────────────────────
+    async def ping(self) -> None:
+        """轻量存活探测：只读 SELECT 1，不产生写放大（/readyz 使用）。"""
+        db = self._require_db()
+        cursor = await db.execute("SELECT 1")
+        await cursor.fetchone()
 
     # ── 用量与计费（恰好一次）─────────────────────────────────
     async def record_usage(
@@ -189,25 +199,38 @@ class MetricsStore:
         await db.commit()
         inserted = cursor.rowcount == 1
         if inserted:
-            await self._bump_daily_aggregate(provider, model, total, latency_ms, cost_usd)
+            await self._bump_daily_aggregate(
+                provider, model, prompt_tokens, completion_tokens, total,
+                latency_ms, cost_usd,
+            )
         return inserted
 
     async def _bump_daily_aggregate(
-        self, provider: str, model: str, total_tokens: int, latency_ms: float, cost_usd: float
+        self, provider: str, model: str,
+        prompt_tokens: int, completion_tokens: int, total_tokens: int,
+        latency_ms: float, cost_usd: float,
     ) -> None:
         db = self._require_db()
         day = time.strftime("%Y-%m-%d")
         await db.execute(
             """
-            INSERT INTO daily_aggregates (day, provider, model, requests, errors, total_tokens, cost_usd, total_latency_ms)
-            VALUES (?, ?, ?, 1, 0, ?, ?, ?)
+            INSERT INTO daily_aggregates (
+                day, provider, model, requests, errors,
+                prompt_tokens, completion_tokens, total_tokens, cost_usd, total_latency_ms
+            ) VALUES (?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(day, provider, model) DO UPDATE SET
                 requests = requests + 1,
+                prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = completion_tokens + excluded.completion_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
                 cost_usd = cost_usd + excluded.cost_usd,
                 total_latency_ms = total_latency_ms + excluded.total_latency_ms
             """,
-            (day, provider, model, total_tokens, cost_usd, latency_ms),
+            (
+                day, provider, model,
+                prompt_tokens, completion_tokens, total_tokens,
+                cost_usd, latency_ms,
+            ),
         )
         await db.commit()
 
@@ -469,6 +492,23 @@ class MetricsStore:
         if "estimated" not in have:
             await db.execute(
                 "ALTER TABLE usage_metrics ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0"
+            )
+
+    async def _migrate_daily_aggregates_if_needed(self) -> None:
+        """旧库 daily_aggregates 补齐 prompt/completion 分列。
+
+        历史行无分列、无法反推拆分，按 0 处理；需要精确历史拆分请回查 usage_metrics。
+        """
+        db = self._require_db()
+        info = await (await db.execute("PRAGMA table_info(daily_aggregates)")).fetchall()
+        have = {row["name"] for row in info}
+        if "prompt_tokens" not in have:
+            await db.execute(
+                "ALTER TABLE daily_aggregates ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0"
+            )
+        if "completion_tokens" not in have:
+            await db.execute(
+                "ALTER TABLE daily_aggregates ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0"
             )
 
     async def _migrate_prompt_templates_if_needed(self) -> None:

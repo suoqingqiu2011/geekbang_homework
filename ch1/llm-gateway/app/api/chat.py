@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..adapters.registry import get_adapter
 from ..context import AppContext
 from ..core.retry_fallback import RetryPolicy
+from ..core.router import estimate_prompt_tokens
 from ..core.trace_freeze import TraceFreezeRecord
 from ..errors import (
     GatewayError,
@@ -81,8 +82,27 @@ async def list_models(request: Request) -> ModelsResponse:
 # ─────────────────────────────────────────────────────────────
 @router.post("/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
+    """请求入口：统一记录请求量/耗时指标后转交管道实现。"""
     ctx: AppContext = request.app.state.ctx
+    t0 = time.monotonic()
+    status = "success"
+    try:
+        return await _chat_completions_impl(request, body, ctx)
+    except GatewayError as exc:
+        status = exc.code
+        raise
+    except Exception:
+        status = "internal_error"
+        raise
+    finally:
+        ctx.metrics.record_request(
+            "chat/completions", status, time.monotonic() - t0
+        )
 
+
+async def _chat_completions_impl(
+    request: Request, body: ChatCompletionRequest, ctx: AppContext
+):
     # 1. 鉴权
     await ctx.auth.check(request.headers.get("authorization"), ctx.config_manager.get_api_keys)
 
@@ -94,6 +114,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         user_id=body.user,
     )
     if not allowed:
+        ctx.metrics.inc_rate_limit_rejected()
         raise RateLimitExceededError(
             f"Rate limit exceeded (layer={layer}). Retry after {retry_after:.1f}s.",
             retry_after=retry_after,
@@ -140,6 +161,7 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         budget_usd=body.budget_usd,
         spent_usd=spent_usd,
         max_tokens=body.max_tokens,
+        prompt_tokens_estimate=estimate_prompt_tokens(messages),
     )
 
     # 7/8. 流式 or 非流式
@@ -168,11 +190,19 @@ async def _handle_completion(
         upstream_rf = _upstream_response_format(body, capability)
         upstream_msgs = _upstream_messages(messages, upstream_rf, schema)
         try:
+            ctx.metrics.inc_upstream_attempt()
             result = await adapter.chat_complete(
                 upstream_msgs,
                 candidate.upstream_model,
                 temperature=body.temperature,
                 max_tokens=body.max_tokens,
+                top_p=body.top_p,
+                stop=body.stop,
+                presence_penalty=body.presence_penalty,
+                frequency_penalty=body.frequency_penalty,
+                seed=body.seed,
+                logprobs=body.logprobs,
+                top_logprobs=body.top_logprobs,
                 response_format=upstream_rf,
                 trace_id=trace.trace_id,
             )
@@ -188,11 +218,19 @@ async def _handle_completion(
                     "Upstream 400 with response_format, retrying without it + json hint (provider=%s)",
                     candidate.provider,
                 )
+                ctx.metrics.inc_upstream_attempt()
                 result = await adapter.chat_complete(
                     retry_msgs,
                     candidate.upstream_model,
                     temperature=body.temperature,
                     max_tokens=body.max_tokens,
+                    top_p=body.top_p,
+                    stop=body.stop,
+                    presence_penalty=body.presence_penalty,
+                    frequency_penalty=body.frequency_penalty,
+                    seed=body.seed,
+                    logprobs=body.logprobs,
+                    top_logprobs=body.top_logprobs,
                     response_format=None,
                     trace_id=trace.trace_id,
                 )
@@ -216,7 +254,11 @@ async def _handle_completion(
     elapsed_ms = (time.monotonic() - t_start) * 1000.0
     result = outcome.result
     provider_cfg = cfg.providers[outcome.provider]
-    cost_usd = result.usage.total_tokens / 1_000_000.0 * provider_cfg.cost_per_million_tokens
+    cost_prompt, cost_completion = provider_cfg.resolve_effective_costs()
+    cost_usd = (
+        result.usage.prompt_tokens / 1_000_000.0 * cost_prompt
+        + result.usage.completion_tokens / 1_000_000.0 * cost_completion
+    )
     if result.usage.estimated:
         cost_usd = 0.0  # 估算行（无上游 usage/字符数兜底）不计入真实计费
 
@@ -263,6 +305,7 @@ async def _handle_completion(
             ChoiceOut(
                 message={"role": "assistant", "content": result.content},
                 finish_reason=result.finish_reason,
+                logprobs=result.logprobs,
             )
         ],
         usage=UsageOut(
@@ -325,11 +368,17 @@ async def _handle_stream(
                     #   上一尝试输出首 token 后失败，重试时会继续保留旧 ttft，
                     #   导致 TTFT 归因到失败的尝试而非本次成功候选（同候选内跨尝试 bug）。
                     candidate_first_token = True
+                    ctx.metrics.inc_upstream_attempt()
                     agen = adapter.stream_chat(
                         upstream_msgs,
                         candidate.upstream_model,
                         temperature=body.temperature,
                         max_tokens=body.max_tokens,
+                        top_p=body.top_p,
+                        stop=body.stop,
+                        presence_penalty=body.presence_penalty,
+                        frequency_penalty=body.frequency_penalty,
+                        seed=body.seed,
                         response_format=upstream_rf,
                         trace_id=trace.trace_id,
                     )
@@ -482,7 +531,11 @@ async def _handle_stream(
             if success_provider is not None and final_usage is not None:
                 await ctx.circuit.record_success(ctx.store, success_provider)
                 provider_cfg = cfg.providers[success_provider]
-                cost_usd = final_usage.total_tokens / 1_000_000.0 * provider_cfg.cost_per_million_tokens
+                cost_prompt, cost_completion = provider_cfg.resolve_effective_costs()
+                cost_usd = (
+                    final_usage.prompt_tokens / 1_000_000.0 * cost_prompt
+                    + final_usage.completion_tokens / 1_000_000.0 * cost_completion
+                )
                 if final_usage.estimated:
                     cost_usd = 0.0  # 估算行（无上游 usage/字符数兜底）不计入真实计费
 

@@ -70,6 +70,7 @@ async def _daily(args) -> None:
             print(
                 f"{r['day']}  {r['provider']:<12} {r['model']:<20} "
                 f"req={r['requests']:<6} err={r['errors']:<4} "
+                f"prompt={r['prompt_tokens']:<8} completion={r['completion_tokens']:<8} "
                 f"tokens={r['total_tokens']:<10} cost=${r['cost_usd']:.4f} "
                 f"avg_latency={r['total_latency_ms'] / max(r['requests'], 1):.1f}ms"
             )

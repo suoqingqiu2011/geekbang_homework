@@ -9,6 +9,7 @@ from .core.cancellation import CancellationHandler
 from .core.circuit_breaker import CircuitBreakerManager
 from .core.config_manager import ConfigurationManager
 from .core.http_client_pool import SharedHttpClientPool
+from .core.metrics_collector import GatewayMetrics
 from .core.prompt_renderer import PromptRenderer
 from .core.rate_limiter import RateLimiter
 from .core.retry_fallback import RetryFallbackManager, RetryPolicy
@@ -30,3 +31,4 @@ class AppContext:
     validator: StructuredOutputValidator
     prompt_renderer: PromptRenderer
     cancellation: CancellationHandler
+    metrics: GatewayMetrics
