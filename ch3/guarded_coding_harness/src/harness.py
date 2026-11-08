@@ -53,6 +53,14 @@ from gate import Gate, ToolSpec
 from sandbox import Sandbox, SandboxViolation, is_process_alive, kill_tree
 from state_store import StateStore
 
+MAX_PATTERN_CHARS = 200
+MAX_SEARCH_LINE_CHARS = 2000
+MAX_SEARCH_FILES = 2000
+SEARCH_DEADLINE_SECONDS = 5.0
+MAX_READ_BYTES = 1_000_000
+# 粗粒度识别嵌套量词（ReDoS 常见形态，如 (a+)+ / (a*)* / (a+){2,}）。
+NESTED_QUANTIFIER = re.compile(r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{[0-9]+(?:,[0-9]*)?\})")
+
 DEFAULT_SUITES: dict[str, list[str]] = {
     "target": ["tests/test_target.py"],
     "boundary": ["tests/test_boundary.py"],
@@ -205,7 +213,8 @@ class ToolRuntime:
     # -- 工具实现 -----------------------------------------------------------
     def _do_list_files(self, arguments: dict[str, Any], tool_call_id: str) -> str:
         path = arguments.get("path", ".")
-        max_entries = int(arguments.get("max_entries", 50))
+        # 上限硬编码，避免模型用超大 max_entries 把遍历变成耗时攻击。
+        max_entries = min(int(arguments.get("max_entries", 50)), 500)
         target = self.sandbox.resolve(path, mode="read")
         entries: list[str] = []
         if target.is_file():
@@ -214,13 +223,20 @@ class ToolRuntime:
             for dirpath, dirnames, filenames in os.walk(target, followlinks=False):
                 dirnames[:] = sorted(d for d in dirnames if d not in {"__pycache__", ".git", ".pytest_cache", ".harness"})
                 for name in sorted(filenames):
-                    entries.append(self._rel(Path(dirpath) / name))
+                    candidate = Path(dirpath) / name
+                    if self._safe_read_path(candidate) is None:
+                        continue
+                    entries.append(self._rel(candidate))
                     if len(entries) >= max_entries:
                         return canonical_json({"entries": entries, "truncated": True})
         return canonical_json({"entries": entries, "truncated": False})
 
     def _do_search_code(self, arguments: dict[str, Any], tool_call_id: str) -> str:
         pattern = arguments["pattern"]
+        if len(pattern) > MAX_PATTERN_CHARS:
+            raise ValueError(f"正则表达式过长：{len(pattern)} 字符，上限 {MAX_PATTERN_CHARS}")
+        if NESTED_QUANTIFIER.search(pattern):
+            raise ValueError("正则表达式包含嵌套量词（可能触发灾难性回溯），请改写为等价非嵌套形式")
         path = arguments.get("path", ".")
         try:
             regex = re.compile(pattern)
@@ -232,21 +248,27 @@ class ToolRuntime:
             Path(dirpath) / name
             for dirpath, dirnames, filenames in os.walk(target)
             for name in sorted(filenames)
-            if not any(skip in Path(dirpath).parts for skip in ("__pycache__", ".git", ".harness"))
+            if not any(skip in Path(dirpath).parts for skip in ("__pycache__", ".git", ".pytest_cache", ".harness"))
         ]
-        for file_path in files:
+        deadline = time.monotonic() + SEARCH_DEADLINE_SECONDS
+        for index, file_path in enumerate(files[:MAX_SEARCH_FILES]):
+            if index and time.monotonic() > deadline:
+                return canonical_json({"matches": matches, "truncated": True, "reason": "deadline"})
+            safe = self._safe_read_path(file_path)
+            if safe is None:
+                continue
             try:
-                if file_path.stat().st_size > 1_000_000:
+                if safe.stat().st_size > MAX_READ_BYTES:
                     continue
-                text = file_path.read_text(encoding="utf-8", errors="replace")
+                text = safe.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             for number, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
-                    matches.append({"path": self._rel(file_path), "line": number, "text": line[:200]})
+                if regex.search(line[:MAX_SEARCH_LINE_CHARS]):
+                    matches.append({"path": self._rel(safe), "line": number, "text": line[:200]})
                     if len(matches) >= 50:
                         return canonical_json({"matches": matches, "truncated": True})
-        return canonical_json({"matches": matches, "truncated": False})
+        return canonical_json({"matches": matches, "truncated": len(files) > MAX_SEARCH_FILES})
 
     def _do_read_file(self, arguments: dict[str, Any], tool_call_id: str) -> str:
         path = arguments["path"]
@@ -255,6 +277,11 @@ class ToolRuntime:
         target = self.sandbox.resolve(path, mode="read")
         if not target.is_file():
             raise ValueError(f"文件不存在：{path}")
+        size = target.stat().st_size
+        if size > MAX_READ_BYTES:
+            raise ValueError(
+                f"文件过大：{size} 字节，上限 {MAX_READ_BYTES}；请改用 search_code 或分段读取更小的文件"
+            )
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         selected = lines[start_line - 1: start_line - 1 + max_lines]
         return canonical_json(
@@ -372,6 +399,7 @@ class ToolRuntime:
         result = {"target": self._rel(target), "path": str(target), "sha256": post_sha, "patch": True}
         self.state.write_result(signature, post_sha256=post_sha, result=result)
         self.state.mark_applied(signature, result)
+        self.state.record_artifact(self._rel(target), {"sha256": post_sha})
         self.audit.append(
             "write.applied",
             self.state.run_id,
@@ -405,6 +433,13 @@ class ToolRuntime:
             detail={"scope": scope, "argv": command, "signature": signature},
         )
         result = self.sandbox.run(command, cwd=self.workspace, timeout=self.policy.command_timeout)
+        # terminated（进程树被强杀）一律不算通过，与 Evidence.is_passing() 保持同一口径。
+        ok = (
+            result.returncode == 0
+            and not result.timed_out
+            and not result.cancelled
+            and not result.terminated
+        )
         payload = {
             "scope": scope,
             "argv": command,
@@ -424,11 +459,10 @@ class ToolRuntime:
             self.state.run_id,
             tool_call_id=tool_call_id,
             actor="model",
-            decision="allow" if result.returncode == 0 and not result.terminated else "error",
+            decision="allow" if ok else "error",
             rule="run_test",
             detail={**payload, "fingerprint": fingerprint},
         )
-        ok = result.returncode == 0 and not result.timed_out and not result.cancelled
         return canonical_json({"ok": ok, **payload})
 
     def _do_record_evidence(self, arguments: dict[str, Any], tool_call_id: str) -> str:
@@ -442,6 +476,22 @@ class ToolRuntime:
             kind=kind,
             payload={"summary": summary, "ok": ok},
             fingerprint=fingerprint,
+        )
+        self.audit.append(
+            "evidence.record",
+            self.state.run_id,
+            tool_call_id=tool_call_id,
+            actor="model",
+            decision="allow",
+            rule="record_evidence",
+            detail={
+                "scope": scope,
+                "kind": kind,
+                "ok": ok,
+                "seq": evidence.seq,
+                "fingerprint": fingerprint,
+                "step": self.current_step,
+            },
         )
         return canonical_json({"ok": True, "evidence": evidence.to_dict()})
 
@@ -459,9 +509,26 @@ class ToolRuntime:
         return canonical_json({"ok": True, "plan": plan})
 
     def _do_final_answer(self, arguments: dict[str, Any], tool_call_id: str) -> str:
-        return str(arguments.get("answer", ""))
+        answer = str(arguments.get("answer", ""))
+        self.audit.append(
+            "final.answer",
+            self.state.run_id,
+            tool_call_id=tool_call_id,
+            actor="model",
+            decision="allow",
+            rule="final_answer",
+            detail={"answer": answer, "step": self.current_step},
+        )
+        return answer
 
     # -- 辅助 ---------------------------------------------------------------
+    def _safe_read_path(self, path: Path) -> Path | None:
+        """遍历发现的文件必须逐个复检：敏感名、后缀与链接逃逸一律跳过。"""
+        try:
+            return self.sandbox.resolve(self._rel(path), mode="read")
+        except SandboxViolation:
+            return None
+
     def _rel(self, path: Path | str) -> str:
         try:
             return os.path.relpath(str(path), str(self.workspace)).replace(os.sep, "/")
@@ -681,6 +748,28 @@ def build_specs(policy: HarnessPolicy, sandbox: Sandbox) -> dict[str, ToolSpec]:
     }
 
 
+def ensure_text_tolerant(model: Any) -> Any:
+    """让「模型只回纯文本」不再触发解析异常。
+
+    smolagents 在 tool_calls 为空时会调用 model.parse_tool_calls，默认实现要求文本
+    内含 JSON blob，否则抛 AgentParsingError 并在日志刷错误。真实模型（尤其带思考
+    模式）常先输出一段纯文本，这不该中断 Run：Harness 在空批次分支给出明确反馈，
+    完成态仍由 final_answer 契约把关。
+    """
+    if getattr(model, "_harness_text_tolerant", False):
+        return model
+    original = model.parse_tool_calls
+
+    def parse_tool_calls(message: Any) -> Any:
+        if getattr(message, "tool_calls", None):
+            return original(message)
+        return message
+
+    model.parse_tool_calls = parse_tool_calls
+    model._harness_text_tolerant = True
+    return model
+
+
 class GuardedToolCallingAgent(ToolCallingAgent):
     """唯一拦截缝：覆写 process_tool_calls，执行段继续复用 super()。"""
 
@@ -701,12 +790,29 @@ class GuardedToolCallingAgent(ToolCallingAgent):
         calls = list(chat_message.tool_calls or [])
         harness._pre_step()
         if not calls:
+            text = str(getattr(chat_message, "content", "") or "").strip()
             memory_step.tool_calls = None
+            memory_step.observations = (
+                "未检测到工具调用：纯文本不会被接受为交付或完成。"
+                "请继续调用工具；若任务确实已完成，请调用 final_answer(answer=...)。"
+            )
+            harness.audit.append(
+                "model.text_only",
+                harness.run_id,
+                actor="model",
+                decision="ignore",
+                rule="no_tool_call",
+                detail={"step": harness.current_step, "content": text[:500]},
+            )
             return
         requests = [harness.build_request(call, harness.current_step) for call in calls]
         harness.runtime.register_calls(requests)
         verdicts = harness.gate.evaluate_batch(requests, harness.current_step)
-        harness.gate.commit_batch(requests, verdicts, harness.current_step)
+        all_allow = all(verdict.decision == Decision.ALLOW for verdict in verdicts)
+        # 只有整批都能执行时才扣写/测试预算、消耗审批；否则整批会在下面中止。
+        harness.gate.commit_batch(
+            requests, verdicts, harness.current_step, charge_side_effects=all_allow
+        )
 
         for request, verdict in zip(requests, verdicts):
             if verdict.decision == Decision.REQUIRE_APPROVAL:
@@ -755,7 +861,7 @@ class GuardedHarness:
                  sandbox: Sandbox | None = None, harness_dir: str | None = None) -> None:
         self.workspace = Path(workspace).resolve()
         self.policy = policy or HarnessPolicy()
-        self.model = model
+        self.model = ensure_text_tolerant(model)
         base_dir = Path(harness_dir) if harness_dir else self.workspace / "artifacts" / ".harness"
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -872,16 +978,18 @@ class GuardedHarness:
         self.sandbox.reset_cancel()
         self._last_stop = None
         self._run_started_at = time.monotonic()
-        self._running = True
 
         # IMP-04：进程退出未确认时禁止同工作区再次运行。
         if self.state.termination.get("unconfirmed"):
-            self._running = False
             raise UnknownResult(
                 "上次运行有进程退出未确认，禁止在同一工作区再次运行",
                 subject=Subject.PROCESS,
             )
+        if reset:
+            # 必须先检查再 reset：reset_state 会清空 writes/tests，否则未决意图被静默丢弃。
+            self.state.assert_ready_for_session()
 
+        self._running = True
         if reset:
             self.state.reset_state(task, self.policy.limits())
             self.state.begin_session()
@@ -904,6 +1012,8 @@ class GuardedHarness:
             return self._execute(task, reset=reset)
         finally:
             self._running = False
+            # 会话结束后必须清空：否则非运行态的 cancel() 会拿旧 PID 杀无关进程。
+            self.sandbox.last_pid = None
 
     def resume(self, *, decisions: dict[str, str] | None = None, task: str | None = None) -> HarnessResult:
         checkpoint = self.checkpoints.latest()
@@ -954,7 +1064,9 @@ class GuardedHarness:
                 step=int(self.state.data.get("step", 0)),
             )
             if plan.action != "resume":
-                self.state.set_status(RunStatus.WAITING_RECONCILE, stop_reason=plan.stop_reason)
+                self.state.set_status(self._status_for_stop(plan.stop_reason), stop_reason=plan.stop_reason)
+                if plan.stop_reason == StopReason.WORKSPACE_CHANGED.value:
+                    self.state.set_blocked(plan.reason, stop_reason=plan.stop_reason)
                 self.state.save()
                 self.checkpoints.save(self.state.snapshot(), step=int(self.state.data.get("step", 0)), boundary="reconcile")
                 raise self._exception_for(plan.stop_reason, plan.reason, plan.writes)
@@ -984,6 +1096,7 @@ class GuardedHarness:
             return self._execute(resume_task, reset=False)
         finally:
             self._running = False
+            self.sandbox.last_pid = None
 
     def _execute(self, task: str, *, reset: bool) -> HarnessResult:
         agent = self._ensure_agent()
@@ -1003,7 +1116,7 @@ class GuardedHarness:
                 rule=type(exc).__name__,
                 detail={"message": str(exc)},
             )
-            raise
+            return self._result(output=None, message=f"模型执行出错：{exc}")
 
         if self._accepted:
             self.state.set_status(RunStatus.COMPLETED, stop_reason=StopReason.COMPLETED.value)
@@ -1035,20 +1148,26 @@ class GuardedHarness:
                 return error
         return None
 
+    @staticmethod
+    def _status_for_stop(reason: Any) -> RunStatus:
+        """停机原因 → 运行态的唯一映射，供 _on_halt 与 resume 共用。"""
+        key = reason.value if isinstance(reason, StopReason) else str(reason)
+        mapping = {
+            StopReason.APPROVAL_REQUIRED.value: RunStatus.WAITING_APPROVAL,
+            StopReason.WORKSPACE_CHANGED.value: RunStatus.WAITING_RECONCILE,
+            StopReason.UNKNOWN_RESULT.value: RunStatus.WAITING_RECONCILE,
+            StopReason.PAUSED.value: RunStatus.PAUSED,
+            StopReason.CANCELLED.value: RunStatus.CANCELLED,
+            StopReason.BUDGET_EXCEEDED.value: RunStatus.FAILED,
+            StopReason.POLICY_DENIED.value: RunStatus.FAILED,
+        }
+        return mapping.get(key, RunStatus.FAILED)
+
     def _on_halt(self, halt: HarnessHalt) -> HarnessResult:
         reason = halt.stop_reason
-        mapping = {
-            StopReason.APPROVAL_REQUIRED: RunStatus.WAITING_APPROVAL,
-            StopReason.WORKSPACE_CHANGED: RunStatus.WAITING_RECONCILE,
-            StopReason.UNKNOWN_RESULT: RunStatus.WAITING_RECONCILE,
-            StopReason.PAUSED: RunStatus.PAUSED,
-            StopReason.CANCELLED: RunStatus.CANCELLED,
-            StopReason.BUDGET_EXCEEDED: RunStatus.FAILED,
-            StopReason.POLICY_DENIED: RunStatus.FAILED,
-        }
-        status = mapping.get(reason, RunStatus.FAILED)
+        status = self._status_for_stop(reason)
         if reason == StopReason.CANCELLED:
-            pid = self.sandbox.last_pid
+            pid = self.sandbox.recent_pid
             if pid and is_process_alive(pid):
                 self.state.set_termination(True, pid)
             else:
@@ -1147,6 +1266,9 @@ class GuardedHarness:
         )
         self.state.record_approval(approval)
         self.state.pop_pending(tool_call_id)
+        # 尚未处理的 pending 仍需要阻断；全部处理完才解除，否则 resume 会被旧 blocked 永久拒绝。
+        if not self.state.pending_items():
+            self.state.clear_blocked()
         self.state.set_status(RunStatus.WAITING_APPROVAL, stop_reason=StopReason.APPROVAL_REQUIRED.value)
         self.state.save()
         self.checkpoints.save(self.state.snapshot(), step=self.current_step, boundary="approval-rejected")
@@ -1179,6 +1301,9 @@ class GuardedHarness:
                 except SandboxViolation:
                     current_sha = None
             raw = decisions.get(signature)
+            if raw is None:
+                call_id = record.get("tool_call_id") or ""
+                raw = decisions.get(call_id) if call_id else None
             if raw is None:
                 verdict = classify_write(record, current_sha)
             else:
@@ -1235,6 +1360,25 @@ class GuardedHarness:
             "actor": actor,
             "note": note,
         }
+
+    def abandon_tests(self, *, actor: str = "human", note: str = "") -> dict[str, Any]:
+        """人工销记无从判定的测试意图，解除 resume 的 unknown_result 阻断。"""
+        changed = self.state.fail_test_intents(session=self.state.session)
+        for signature in changed:
+            record = self.state.tests().get(signature) or {}
+            self.audit.append(
+                "test.abandoned",
+                self.state.run_id,
+                tool_call_id=record.get("tool_call_id") or None,
+                actor=actor,
+                decision="uncertain",
+                rule="abandon_tests",
+                detail={"signature": signature, "scope": record.get("scope", ""), "note": note},
+            )
+        if changed:
+            self.state.save()
+            self.checkpoints.save(self.state.snapshot(), step=self.current_step, boundary="abandon-tests")
+        return {"abandoned": changed, "actor": actor, "note": note}
 
     # -- 暂停 / 取消 ---------------------------------------------------------
     def pause(self) -> None:

@@ -1,2 +1,16 @@
-﻿...................................s..................                   [100%]
-53 passed, 1 skipped in 13.71s
+﻿============================= test session starts =============================
+platform win32 -- Python 3.14.7, pytest-9.2.0, pluggy-1.7.0
+rootdir: C:\projet\homework\ch3\guarded_coding_harness
+configfile: pyproject.toml
+testpaths: tests
+plugins: anyio-4.16.0
+collected 74 items
+
+tests\test_audit.py .....                                                [  6%]
+tests\test_completion.py .........                                       [ 18%]
+tests\test_gate.py .............                                         [ 36%]
+tests\test_harness_loop.py ......................                        [ 66%]
+tests\test_sandbox.py ...........                                        [ 81%]
+tests\test_state_checkpoint.py ..............                            [100%]
+
+============================= 74 passed in 9.15s ==============================

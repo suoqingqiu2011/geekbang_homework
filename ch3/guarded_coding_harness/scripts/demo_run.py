@@ -18,7 +18,7 @@ from harness import GuardedHarness, HarnessPolicy  # noqa: E402
 
 DEMO_DIR = ROOT / "artifacts" / "harness-demo"
 WORKSPACE = DEMO_DIR / "workspace"
-RUN_ARTIFACTS = ("audit.jsonl", "state.json", "checkpoints", "logs", "run-summary.md")
+RUN_ARTIFACTS = ("audit.jsonl", "audit.jsonl.head", "state.json", "checkpoints", "logs", "run-summary.md")
 
 
 def build_workspace() -> None:

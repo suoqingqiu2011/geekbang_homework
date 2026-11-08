@@ -247,11 +247,9 @@ class Evidence:
     at: str
 
     def is_passing(self) -> bool:
-        # IMP-07：取消/超时不得被归因为断言失败，也不得算通过。
+        # IMP-07：取消/超时/进程树被强杀都不得归因为断言失败，也不得算通过。
         if self.is_acceptance():
-            if self.payload.get("cancelled") or self.payload.get("timed_out"):
-                return False
-            if self.payload.get("terminated") and not self.payload.get("returncode") == 0:
+            if self.payload.get("cancelled") or self.payload.get("timed_out") or self.payload.get("terminated"):
                 return False
             try:
                 return int(self.payload.get("returncode", 1)) == 0

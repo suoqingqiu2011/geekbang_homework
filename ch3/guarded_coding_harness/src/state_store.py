@@ -120,7 +120,7 @@ class StateStore:
         self.data["run_id"] = ulid()
         self.data["task"] = task
 
-    def begin_session(self) -> str:
+    def assert_ready_for_session(self) -> None:
         open_writes = self.open_writes()
         open_tests = self.open_tests()
         if open_writes:
@@ -133,6 +133,9 @@ class StateStore:
                 "存在未销记的测试意图，禁止开启新 session；请先核对",
                 subject=Subject.TEST_RUN,
             )
+
+    def begin_session(self) -> str:
+        self.assert_ready_for_session()
         session = ulid()
         self.data["session"] = session
         self.data["status"] = RunStatus.RUNNING.value
@@ -170,6 +173,9 @@ class StateStore:
 
     def budget_used(self, key: str) -> float:
         return float(self.data["budget"]["used"].get(key, 0.0))
+
+    def budget_limit(self, key: str) -> float:
+        return self._limit_for(key)
 
     def budget_ok(self, key: str) -> bool:
         return self.budget_used(key) <= self._limit_for(key)

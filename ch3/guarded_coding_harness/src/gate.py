@@ -23,6 +23,18 @@ PreCheck = Callable[[ActionRequest, Any], None]
 
 
 @dataclass
+class _BatchAccounting:
+    """批次内预占：同批请求在 commit 前看不到彼此的台账与预算消耗。"""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    applied: set[str] = field(default_factory=set)
+    reserved: dict[str, float] = field(default_factory=dict)
+
+    def count(self, signature: str) -> int:
+        return int(self.counts.get(signature, 0))
+
+
+@dataclass
 class ToolSpec:
     name: str
     risk: RiskClass
@@ -122,7 +134,7 @@ class Gate:
         self._decisions: dict[str, Decision] = {}
 
     # -- 判定 ---------------------------------------------------------------
-    def evaluate(self, request: ActionRequest) -> GateVerdict:
+    def evaluate(self, request: ActionRequest, *, batch: _BatchAccounting | None = None) -> GateVerdict:
         spec = self.specs.get(request.tool_name)
         if spec is None:
             return self._deny(request, "unknown_tool", f"未知工具：{request.tool_name}", "unknown_tool")
@@ -134,6 +146,11 @@ class Gate:
             return GateVerdict(request=request, decision=Decision.DENY, rule="arguments", error=error)
         request.arguments = cleaned
         request.signature = call_signature(request.tool_name, cleaned)
+
+        # tool_calls 在 commit 时对每个请求都计一次（拒绝也计），先预占再判定。
+        tool_calls_room = self._budget_has_room("tool_calls", batch)
+        if batch is not None:
+            batch.reserved["tool_calls"] = batch.reserved.get("tool_calls", 0.0) + 1.0
 
         if spec.pre_check is not None:
             try:
@@ -150,7 +167,10 @@ class Gate:
             request.context["fingerprint_at_request"] = self.sandbox.fingerprint()
 
         # 重复写入：只把 applied=true 视为已执行，附首次结果回执。
-        if spec.risk == RiskClass.WRITE and self.state.ledger_applied(request.signature):
+        already_applied = self.state.ledger_applied(request.signature) or (
+            batch is not None and request.signature in batch.applied
+        )
+        if spec.risk == RiskClass.WRITE and already_applied:
             first = self.state.ledger_result(request.signature)
             return GateVerdict(
                 request=request,
@@ -162,11 +182,14 @@ class Gate:
                     tool=request.tool_name,
                     tool_call_id=request.tool_call_id,
                     rule="duplicate_write",
-                    detail={"signature": request.signature, "first_result": first},
+                    detail={"signature": request.signature, "first_result": first, "same_batch": first is None},
                 ),
             )
 
-        if self.state.ledger_count(request.signature) >= int(self.policy.repeat_limit):
+        repeat_count = self.state.ledger_count(request.signature)
+        if batch is not None:
+            repeat_count += batch.count(request.signature)
+        if repeat_count >= int(self.policy.repeat_limit):
             return GateVerdict(
                 request=request,
                 decision=Decision.DENY,
@@ -174,7 +197,7 @@ class Gate:
                 error=StructuredError(
                     code="repeat_limit",
                     message=(
-                        f"相同动作已出现 {self.state.ledger_count(request.signature)} 次，"
+                        f"相同动作已出现 {repeat_count} 次，"
                         f"达到上限 {self.policy.repeat_limit}；请更换参数或调整计划"
                     ),
                     tool=request.tool_name,
@@ -184,17 +207,18 @@ class Gate:
                 ),
             )
 
-        if not self.state.budget_can_spend("tool_calls"):
+        if not tool_calls_room:
             return self._deny(request, "budget_exceeded", "tool_calls 预算已耗尽", "budget")
-        if spec.risk == RiskClass.WRITE and not self.state.budget_can_spend("writes"):
+        if spec.risk == RiskClass.WRITE and not self._budget_has_room("writes", batch):
             return self._deny(request, "budget_exceeded", "writes 预算已耗尽", "budget")
-        if request.tool_name == "run_test" and not self.state.budget_can_spend("test_runs"):
+        if request.tool_name == "run_test" and not self._budget_has_room("test_runs", batch):
             return self._deny(request, "budget_exceeded", "test_runs 预算已耗尽", "budget")
 
         if spec.risk == RiskClass.WRITE and bool(getattr(self.policy, "require_write_approval", True)):
             fingerprint = request.context.get("fingerprint_at_request") or self.sandbox.fingerprint()
             approval = self.state.find_approval(request.signature, fingerprint, request.step)
             if approval is not None:
+                self._reserve_allow(request, spec, batch)
                 return GateVerdict(
                     request=request,
                     decision=Decision.ALLOW,
@@ -215,7 +239,23 @@ class Gate:
                 ),
             )
 
+        self._reserve_allow(request, spec, batch)
         return GateVerdict(request=request, decision=Decision.ALLOW, rule="allowed")
+
+    def _budget_has_room(self, key: str, batch: _BatchAccounting | None) -> bool:
+        used = self.state.budget_used(key)
+        if batch is not None:
+            used += batch.reserved.get(key, 0.0)
+        return used < self.state.budget_limit(key)
+
+    def _reserve_allow(self, request: ActionRequest, spec: ToolSpec, batch: _BatchAccounting | None) -> None:
+        if batch is None:
+            return
+        if spec.risk == RiskClass.WRITE:
+            batch.reserved["writes"] = batch.reserved.get("writes", 0.0) + 1.0
+            batch.applied.add(request.signature)
+        if request.tool_name == "run_test":
+            batch.reserved["test_runs"] = batch.reserved.get("test_runs", 0.0) + 1.0
 
     @staticmethod
     def _deny(request: ActionRequest, code: str, message: str, rule: str) -> GateVerdict:
@@ -235,10 +275,13 @@ class Gate:
     # -- 批次 ---------------------------------------------------------------
     def evaluate_batch(self, requests: list[ActionRequest], step: int) -> list[GateVerdict]:
         verdicts: list[GateVerdict] = []
+        batch = _BatchAccounting()
         for request in requests:
             request.step = int(step)
-            verdict = self.evaluate(request)
+            verdict = self.evaluate(request, batch=batch)
             verdicts.append(verdict)
+            # 同批后续请求必须看得到本请求已占用的次数与已写入标记。
+            batch.counts[request.signature] = batch.count(request.signature) + 1
             self._decisions[request.signature] = verdict.decision
             self.audit.append(
                 "gate.decision",
@@ -258,12 +301,23 @@ class Gate:
             )
         return verdicts
 
-    def commit_batch(self, requests: list[ActionRequest], verdicts: list[GateVerdict], step: int) -> None:
+    def commit_batch(
+        self,
+        requests: list[ActionRequest],
+        verdicts: list[GateVerdict],
+        step: int,
+        *,
+        charge_side_effects: bool = True,
+    ) -> None:
         for request, verdict in zip(requests, verdicts):
             # tool_calls 入口即计（拒绝也计）。
             self.state.charge("tool_calls", 1)
-            self.state.ledger_record(request.signature, request.tool_call_id)
+            # 整批无法执行时，ALLOW 项既没落盘也没跑测，不能记台账、扣写预算或消耗审批。
+            if charge_side_effects or verdict.decision != Decision.ALLOW:
+                self.state.ledger_record(request.signature, request.tool_call_id)
             if verdict.decision == Decision.ALLOW:
+                if not charge_side_effects:
+                    continue
                 if request.risk == RiskClass.WRITE:
                     self.state.charge("writes", 1)
                     approval = self.state.find_approval(

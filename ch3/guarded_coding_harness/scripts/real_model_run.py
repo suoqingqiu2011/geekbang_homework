@@ -1,8 +1,10 @@
 """T2：用真实模型（DeepSeek OpenAI 兼容接口）跑通一次受控修复任务。
 
 用法：
-    set DEEPSEEK_API_KEY=...            # 必需
     python scripts/real_model_run.py    # 产物写入 artifacts/real-model-demo
+
+脚本会自动加载同目录上一级的 .env（已存在的进程环境变量优先，不会被覆盖），
+因此只要 .env 里写了 DEEPSEEK_API_KEY 即可直接运行，无需在终端里 export。
 
 可选环境变量：
     HARNESS_REAL_MODEL   模型 id（默认 deepseek-v4-pro）
@@ -32,7 +34,36 @@ from harness import GuardedHarness, HarnessPolicy  # noqa: E402
 
 DEMO_DIR = ROOT / "artifacts" / "real-model-demo"
 WORKSPACE = DEMO_DIR / "workspace"
-RUN_ARTIFACTS = ("audit.jsonl", "state.json", "checkpoints", "logs", "run-summary.md")
+RUN_ARTIFACTS = ("audit.jsonl", "audit.jsonl.head", "state.json", "checkpoints", "logs", "run-summary.md")
+
+ENV_CANDIDATES = (PROJECT / ".env", ROOT / ".env")
+
+
+def load_env_file(paths: tuple[Path, ...]) -> Path | None:
+    """加载第一个存在的 .env 文件；已存在的环境变量优先，不会被覆盖。
+
+    支持 `KEY=VALUE`、`export KEY=VALUE`、单/双引号包裹的值与 # 注释行。
+    """
+    for path in paths:
+        if not path.is_file():
+            continue
+        for raw in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return path
+    return None
+
 
 TASK = (
     "任务：修复 src/app.py 中的 add 函数（当前返回 a - b，正确行为是 a + b）。"
@@ -184,10 +215,14 @@ def render_summary(harness: GuardedHarness, info: dict, final_text: str, initial
 
 
 def main() -> int:
+    loaded = load_env_file(ENV_CANDIDATES)
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         print("缺少 DEEPSEEK_API_KEY，无法执行真实模型验证。")
+        print(f"请在 {PROJECT / '.env'} 中写入 DEEPSEEK_API_KEY=sk-xxxx，或通过环境变量提供。")
         return 2
+    if loaded:
+        print(f"已加载环境变量文件: {loaded}")
     model_id = os.environ.get("HARNESS_REAL_MODEL", "deepseek-v4-pro")
     api_base = os.environ.get("HARNESS_REAL_BASE", "https://api.deepseek.com/v1")
 

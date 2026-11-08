@@ -70,7 +70,9 @@ MINIMAL_ENV_KEYS = (
     "LC_ALL",
 )
 
-SKIP_DIR_NAMES = {"artifacts", ".harness", ".git", "__pycache__", ".pytest_cache"}
+SKIP_DIR_NAMES = {".harness", ".git", "__pycache__", ".pytest_cache"}
+# artifacts 只在工区根目录跳过；src/artifacts 之类的深层同名目录仍计入指纹。
+SKIP_ROOT_DIR_NAMES = {"artifacts"}
 
 
 @dataclass
@@ -125,7 +127,9 @@ def workspace_fingerprint(root: str | os.PathLike[str]) -> str:
     base = os.path.abspath(str(root))
     entries: list[list[str]] = []
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-        dirnames[:] = [d for d in sorted(dirnames) if d not in SKIP_DIR_NAMES]
+        at_root = os.path.abspath(dirpath) == base
+        skip = SKIP_DIR_NAMES | (SKIP_ROOT_DIR_NAMES if at_root else set())
+        dirnames[:] = [d for d in sorted(dirnames) if d not in skip]
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             if not os.path.isfile(full):
@@ -300,7 +304,7 @@ class Sandbox:
         env: dict[str, str] | None = None,
         log_dir: str = "artifacts/.harness/logs",
     ) -> None:
-        self.root = os.path.abspath(str(root))
+        self.root = os.path.realpath(str(root))
         self.writable = tuple(writable)
         self.timeout = float(timeout)
         self.allowed_commands = set(allowed_commands) if allowed_commands else set(ALLOWED_COMMAND_NAMES)
@@ -311,6 +315,7 @@ class Sandbox:
 
         self._cancel_event = threading.Event()
         self.last_pid: int | None = None
+        self.recent_pid: int | None = None
 
     # -- 路径 ---------------------------------------------------------------
     def resolve(self, path: str | os.PathLike[str], *, mode: str = "read") -> Path:
@@ -409,52 +414,57 @@ class Sandbox:
         start = time.monotonic()
         timed_out = cancelled = False
         pid: int | None = None
-        with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(work_dir),
-                env=self._build_env(),
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                **kwargs,
-            )
-            pid = proc.pid
-            self.last_pid = pid
-            if os.name == "nt":
-                try:
-                    job = _WinJob()
-                    if not job.assign(pid):
-                        job.close()
+        try:
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=str(work_dir),
+                    env=self._build_env(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    **kwargs,
+                )
+                pid = proc.pid
+                self.last_pid = pid
+                self.recent_pid = pid
+                if os.name == "nt":
+                    try:
+                        job = _WinJob()
+                        if not job.assign(pid):
+                            job.close()
+                            job = None
+                    except Exception:
                         job = None
-                except Exception:
+
+                while True:
+                    if proc.poll() is not None:
+                        break
+                    if event is not None and event.is_set():
+                        cancelled = True
+                        break
+                    if time.monotonic() - start > timeout:
+                        timed_out = True
+                        break
+                    time.sleep(POLL_SECONDS)
+
+                terminated = False
+                if timed_out or cancelled:
+                    kill_tree(pid, job)
+                    terminated = True
+                try:
+                    returncode = proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    kill_tree(pid, job)
+                    terminated = True
+                    returncode = -9
+                if job is not None:
+                    job.close()
                     job = None
-
-            while True:
-                if proc.poll() is not None:
-                    break
-                if event is not None and event.is_set():
-                    cancelled = True
-                    break
-                if time.monotonic() - start > timeout:
-                    timed_out = True
-                    break
-                time.sleep(POLL_SECONDS)
-
-            terminated = False
-            if timed_out or cancelled:
-                kill_tree(pid, job)
-                terminated = True
-            try:
-                returncode = proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                kill_tree(pid, job)
-                terminated = True
-                returncode = -9
-            if job is not None:
-                job.close()
-                job = None
-            duration = time.monotonic() - start
+                duration = time.monotonic() - start
+        finally:
+            # 进程结束后立即清空活跃 PID：非运行态的 cancel() 不会拿旧 PID 误杀无关进程。
+            self.last_pid = None
 
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as handle:

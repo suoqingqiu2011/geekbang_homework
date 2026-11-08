@@ -171,3 +171,62 @@ def test_gate_rejects_forged_test_evidence_kind(workspace):
     )
     assert verdict.decision == Decision.DENY
     assert verdict.error.code == "invalid_argument_value"
+
+
+def test_batch_denies_second_identical_write_before_execution(workspace):
+    """同批同签名写入：第一条占位后，第二条必须按 duplicate_write 拒绝。"""
+    harness, _ = make_harness(workspace, [], require_write_approval=False, max_writes=2)
+    arguments = {"path": "src/app.py", "content": SAMPLE_SOURCE_PATCHED}
+    requests = [
+        ActionRequest(tool_call_id="c1", tool_name="write_file", arguments=dict(arguments), step=1),
+        ActionRequest(tool_call_id="c2", tool_name="write_file", arguments=dict(arguments), step=1),
+    ]
+    verdicts = harness.gate.evaluate_batch(requests, 1)
+    assert verdicts[0].decision == Decision.ALLOW
+    assert verdicts[1].decision == Decision.DENY
+    assert verdicts[1].rule == "duplicate_write"
+    assert verdicts[1].error.detail["same_batch"] is True
+
+
+def test_batch_write_budget_is_reserved_across_requests(workspace):
+    """同批两条不同写入：max_writes=1 时第二条必须在评估阶段被预算拒绝。"""
+    harness, _ = make_harness(workspace, [], require_write_approval=False, max_writes=1)
+    requests = [
+        ActionRequest(tool_call_id="c1", tool_name="write_file", arguments={"path": "src/a.py", "content": "A=1\n"}, step=1),
+        ActionRequest(tool_call_id="c2", tool_name="write_file", arguments={"path": "src/b.py", "content": "B=1\n"}, step=1),
+    ]
+    verdicts = harness.gate.evaluate_batch(requests, 1)
+    assert verdicts[0].decision == Decision.ALLOW
+    assert verdicts[1].decision == Decision.DENY
+    assert verdicts[1].error.code == "budget_exceeded"
+
+
+def test_batch_budget_denial_aborts_before_any_write(workspace):
+    """整批中止不落盘：预算不足时同批第一条 ALLOW 也不会执行。"""
+    harness, _ = make_harness(
+        workspace,
+        [[call("write_file", path="src/a.py", content="A=1\n"),
+          call("write_file", path="src/b.py", content="B=1\n")]],
+        require_write_approval=False,
+        max_writes=1,
+        max_steps=4,
+    )
+    result = harness.run("预算超支批次")
+    assert result.stop_reason == "budget_exceeded"
+    assert not (workspace / "src" / "a.py").exists()
+    assert not (workspace / "src" / "b.py").exists()
+    assert harness.state.budget_used("writes") == 0
+
+
+def test_batch_repeat_limit_counts_same_read_in_one_batch(workspace):
+    """repeat_limit 必须把同批已评估请求计入，不能靠 commit 后的台账。"""
+    harness, _ = make_harness(workspace, [], repeat_limit=1)
+    requests = [
+        ActionRequest(tool_call_id="c1", tool_name="read_file", arguments={"path": "src/app.py"}, step=1),
+        ActionRequest(tool_call_id="c2", tool_name="read_file", arguments={"path": "src/app.py"}, step=1),
+    ]
+    verdicts = harness.gate.evaluate_batch(requests, 1)
+    assert verdicts[0].decision == Decision.ALLOW
+    assert verdicts[1].decision == Decision.DENY
+    assert verdicts[1].rule == "repeat_limit"
+

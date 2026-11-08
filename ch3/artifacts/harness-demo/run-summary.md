@@ -1,6 +1,6 @@
 # Harness 运行记录（demo）
 
-- run_id: `17940453828090001ebedd3b4`
+- run_id: `17941258738370001993a4977`
 - task: 修复 add 函数
 - plan revision: 1
 - 首次运行: status=waiting_approval, stop_reason=approval_required
@@ -17,14 +17,14 @@
 
 ## Checkpoints（按 run 隔离）
 
-- `checkpoints/17940453828090001ebedd3b4/step-000001-after_step.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000002-after_step.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000002-approval.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000002-halt-approval_required.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000003-after_step.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000004-after_step.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000005-after_step.json`
-- `checkpoints/17940453828090001ebedd3b4/step-000005-run_end.json`
+- `checkpoints/17941258738370001993a4977/step-000001-after_step.json`
+- `checkpoints/17941258738370001993a4977/step-000002-after_step.json`
+- `checkpoints/17941258738370001993a4977/step-000002-approval.json`
+- `checkpoints/17941258738370001993a4977/step-000002-halt-approval_required.json`
+- `checkpoints/17941258738370001993a4977/step-000003-after_step.json`
+- `checkpoints/17941258738370001993a4977/step-000004-after_step.json`
+- `checkpoints/17941258738370001993a4977/step-000005-after_step.json`
+- `checkpoints/17941258738370001993a4977/step-000005-run_end.json`
 
 ## 审计事件时间线
 
@@ -51,4 +51,5 @@
 | 19 | test.result | allow | run_test | call-004 |
 | 20 | gate.decision | allow | allowed | call-005 |
 | 21 | gate.batch | batch | commit | None |
-| 22 | run.halt | completed | run_end | None |
+| 22 | final.answer | allow | final_answer | call-005 |
+| 23 | run.halt | completed | run_end | None |

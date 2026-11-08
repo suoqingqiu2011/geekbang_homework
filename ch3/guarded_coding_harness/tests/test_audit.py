@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 
-from audit import AuditLog
+import pytest
+
+from audit import AuditAnchorError, AuditLog
 from conftest import SAMPLE_SOURCE_PATCHED, call, make_harness
 
 
@@ -111,3 +113,25 @@ def test_tampering_breaks_verification(tmp_path):
     ok, message = fresh.verify()
     assert not ok
     assert "哈希校验失败" in message
+
+
+def test_truncated_or_emptied_audit_is_detected(tmp_path):
+    """尾部截断/清空会留下与头锚点不一致的长度，verify 必须拒绝。"""
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path)
+    for index in range(3):
+        log.append("gate.decision", "run-1", tool_call_id=f"c{index}", decision="deny", rule="budget")
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+    ok, message = AuditLog(path).verify()
+    assert not ok
+    assert "截断" in message
+    # 截断后也不允许静默续写，否则会洗掉篡改痕迹。
+    with pytest.raises(AuditAnchorError):
+        AuditLog(path).append("gate.decision", "run-1", tool_call_id="late")
+
+    path.write_text("", encoding="utf-8")
+    ok, message = AuditLog(path).verify()
+    assert not ok
+    assert "清空" in message

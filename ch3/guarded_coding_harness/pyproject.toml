@@ -27,5 +27,5 @@ py-modules = [
 [tool.pytest.ini_options]
 pythonpath = ["src", "../smolagents/src"]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-v -ra"
 filterwarnings = ["ignore::DeprecationWarning"]

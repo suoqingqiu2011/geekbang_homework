@@ -11,6 +11,7 @@ import pytest
 from checkpoint import Checkpoint, classify_batch, classify_write, plan_resume
 from conftest import SAMPLE_SOURCE_PATCHED, call, child_env, make_harness, read
 from contracts import BudgetLimits, ReconcileVerdict, StopReason, UnknownResult, WriteState
+from harness import GuardedHarness
 from state_store import StateStore
 
 
@@ -124,6 +125,37 @@ def test_begin_session_refuses_open_intent(tmp_path):
     state.write_intent("sig:1", tool_call_id="c1", target="src/app.py", pre_sha256=None, session="s1", step=1)
     with pytest.raises(UnknownResult):
         state.begin_session()
+
+
+def test_abandon_tests_unblocks_resume(workspace):
+    harness, _ = make_harness(workspace, [], max_steps=2)
+    harness.state.reset_state("模拟崩溃", harness.policy.limits())
+    harness.state.begin_session()
+    harness.state.test_intent(
+        "sig:test",
+        tool_call_id="call-test",
+        scope="target",
+        command=["python", "-m", "pytest"],
+        session=harness.state.session,
+        step=1,
+    )
+    harness.state.data["step"] = 1
+    harness.state.data["fingerprint"] = harness.sandbox.fingerprint()
+    harness.state.save()
+    harness.checkpoints.save(harness.state.snapshot(), step=1, boundary="simulated-crash")
+
+    resumed = GuardedHarness(workspace, harness.model, policy=harness.policy)
+    with pytest.raises(UnknownResult):
+        resumed.resume()
+    assert resumed.state.open_tests()
+
+    outcome = resumed.abandon_tests(actor="ops", note="进程崩溃，测试结果不可判定")
+    assert "sig:test" in outcome["abandoned"]
+    assert resumed.state.open_tests() == []
+
+    result = resumed.resume()
+    assert result.status in {"failed", "completed"}
+    assert result.stop_reason != StopReason.UNKNOWN_RESULT.value
 
 
 CHILD_RESUME_SCRIPT = """

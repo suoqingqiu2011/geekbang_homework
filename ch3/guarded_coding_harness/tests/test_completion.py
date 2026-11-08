@@ -69,6 +69,19 @@ def test_cancelled_or_timed_out_evidence_never_passes(workspace):
     assert harness.checker.check()[0] is False
 
 
+def test_terminated_evidence_never_passes(workspace):
+    harness, _ = make_harness(workspace, [])
+    fingerprint = harness.sandbox.fingerprint()
+    harness.state.append_evidence(
+        scope="target",
+        kind="test",
+        payload={"returncode": 0, "terminated": True},
+        fingerprint=fingerprint,
+    )
+    assert Evidence.from_dict(harness.state.latest_evidence("target")).is_passing() is False
+    assert harness.checker.check()[0] is False
+
+
 def test_h1_final_answer_without_evidence_is_rejected(workspace):
     harness, _ = make_harness(workspace, [call("final_answer", answer="已修复")], max_steps=3)
     result = harness.run("修复 add")
