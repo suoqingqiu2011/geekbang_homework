@@ -376,7 +376,8 @@ if first.status == "waiting_approval":
 
 - `approve()` 会把审批绑定到「调用签名 + 当前工区指纹 + 步骤」，工区变化后旧审批自动失效（`WorkspaceChanged`）。
 - `reject()` 直接拒绝待审批项，并在所有待审批项都处理完后解除 `blocked`；随后可 `resume()` 让模型换方案继续（重复提交同一动作仍受 `repeat_limit` 约束）。
-- `resume()` 会先读取最新 Checkpoint，再执行 `plan_resume()`：终态、未确认进程、未销记测试意图、指纹变化、未决写入都会阻止恢复。
+- `resume()` 先取当前 run 的最新 Checkpoint 并把快照恢复进 `StateStore`；`load()` 失败（checksum 不符或文件半截）等同于「没有可恢复快照」。随后按固定优先级执行 `plan_resume()`：终态 → 未确认进程 → 未销记测试意图 → 指纹变化 → `blocked`（仅 `approval_required` 可凭有效批准票放行）→ 未决写入（转 `reconcile`）→ 预算耗尽。命中即停，不会跳过前序检查。
+- 判定为 `refuse` 时：`workspace_changed` / `unknown_result` 落到 `waiting_reconcile`，其余落到 `paused`；同时落一份 `*-resume-refused.json` 快照并抛出对应异常（`WorkspaceChanged` / `UnknownResult` / `BudgetExceeded` / `HarnessCancelled` / `PolicyDenied`）。`workspace_changed` 还会写回 `blocked`，防止二次 `resume()` 洗白。
 
 ### 4.4 对账未知写入
 
@@ -416,8 +417,8 @@ harness.state.data          # 完整状态：plan / budget / evidence / writes /
 harness.state.latest_evidence("target")
 harness.audit.by_run(harness.run_id)
 harness.audit.verify()      # -> (True, "ok")；哈希链 + audit.jsonl.head 锚点一起校验
-harness.checkpoints.latest()
-harness.checkpoints.list_snapshots()
+harness.checkpoints.latest()         # 当前 run 最新快照（按 step, mtime）
+harness.checkpoints.list_snapshots() # 当前 run 全部快照
 harness.checker.check()     # -> (bool, message)
 ```
 
@@ -1088,6 +1089,12 @@ ResumePlan(action="resume", reason="可恢复", stop_reason=None,
 
 快照完整性：`save()` 先写 `.tmp-<ulid>` 再 `os.replace` 原子替换，并写入 `checksum = sha256(canonical_json(snapshot))`；`load()` 重算 checksum，不一致则返回 `None`，不参与恢复。`latest()` 按 `(step, mtime_ns)` 取最大：停机后（run 尚未结束时）读到的是更新的审批快照；本 run 最终完成，故最新快照为 `step-000005-run_end.json`。
 
+`plan_resume()` 只给出动作，`resume()` 按动作落地：
+
+- `refuse` → 按 `stop_reason` 置 `waiting_reconcile`（`workspace_changed`、`unknown_result`）或 `paused`（其余），保存 `*-resume-refused.json` 并抛出对应异常；`workspace_changed` 额外写回 `blocked`，保留旧指纹基线，防止二次 `resume()` 洗白。
+- `reconcile` → 未传 `decisions` 时置 `waiting_reconcile`、保存 `*-reconcile.json` 并抛 `UnknownResult`；传入 `decisions` 则先 `reconcile()`，再以更新后的状态重新 `plan_resume()`，仍未通过则再次落快照并抛错。
+- `resume` → 清 `blocked`、撤销 `pause` / `cancel` 信号、`sandbox.reset_cancel()`、把 `state.fingerprint` 刷新为当前值，写 `run.start(rule=resume)` 后以 `reset=False` 继续执行（不重建会话）。
+
 同一条 approval 快照，改动单一条件即可触发对应拒绝分支：
 
 | 改动 | `plan_resume` 返回 |
@@ -1097,6 +1104,7 @@ ResumePlan(action="resume", reason="可恢复", stop_reason=None,
 | `tests` 加一条 `state="intent"` | `refuse` / `unknown_result`，`存在未销记的测试意图` |
 | 当前指纹换成别的值 | `refuse` / `workspace_changed`，`旧证据与旧审批失效` |
 | 删除批准项 | `refuse` / `approval_required`，`存在阻断标记` |
+| `blocked.stop_reason` 改为 `policy_denied` | `refuse` / `policy_denied`，`存在阻断标记`（非审批阻断不能靠批准票放行） |
 | `rejected = true` | 同上（被 rejected 过滤） |
 | `consumed = true` | 同上（已消费，不可复用） |
 | `granted_step = -2`（`diff = 4`） | 同上（TTL 过期） |
@@ -1130,7 +1138,7 @@ print(plan_resume(approval["snapshot"],
 
 对 approval 快照把 `fingerprint` 换成其他值再调用，返回 `refuse` / `workspace_changed`。相关用例见 `tests/test_state_checkpoint.py`（恢复优先级、快照篡改、三态分类、台账释放）。
 
-这段恢复说明四件事：停机不丢状态（`pending`/`blocked`/`ledger`/`budget` 全部落盘）；批准不等于执行（`writes` 仍为空）；恢复有前置条件（指纹、未决测试、未确认进程、批准有效期缺一不可）；快照可自证（`checksum` 使篡改或半截写入被拒绝加载）。
+这段恢复说明四件事：停机不丢状态（`pending`/`blocked`/`ledger`/`budget` 全部落盘）；批准不等于执行（`writes` 仍为空）；恢复有前置条件（终态、未确认进程、未销记测试、指纹、批准有效期、预算任一不满足都会被拦下）；快照可自证（`checksum` 使篡改或半截写入被拒绝加载）。
 
 ---
 
