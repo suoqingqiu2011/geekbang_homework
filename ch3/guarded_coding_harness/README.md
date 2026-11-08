@@ -16,7 +16,7 @@
 | smolagents | 本地源码或 PyPI 包 | 同级目录 `../smolagents`（1.27.0.dev0） |
 | 虚拟环境 | **必须使用独立的 venv / conda / uv 环境** | 项目根目录 `.venv/`（已被 `.gitignore` 忽略）；若本项目被当作 Harness workspace，则建在 `ch3/.venvs/guarded/` |
 
-目录约定：`pyproject.toml` 中 `pythonpath = ["src", "../smolagents/src"]` 要求 smolagents 源码位于与本项目同级的 `../smolagents`。本项目的完整目录结构见第 8 节。
+目录约定：`pyproject.toml` 中 `pythonpath = ["src", "../smolagents/src"]` 要求 smolagents 源码位于与本项目同级的 `../smolagents`。本项目的完整目录结构见第 7 节。
 
 **为什么必须隔离**：
 
@@ -1379,30 +1379,7 @@ def test_write_requires_approval_then_completes(workspace):
 
 ---
 
-## 7. 常见问题
-
-| 现象 | 原因与处理 |
-|---|---|
-| `ModuleNotFoundError: No module named 'smolagents'` | 直接运行 Python 脚本而未安装 smolagents；执行 `python -m pip install -e ..\smolagents`，或按脚本方式把 `../smolagents/src` 加入 `sys.path` |
-| `ModuleNotFoundError: No module named 'harness'` | 未在项目根目录运行，或未把 `src` 加入 `sys.path`；用 `python -m pytest` 时由 `pyproject.toml` 自动处理 |
-| `pytest: command not found` | 使用 `python -m pytest`，并确认 `python -m pip install "pytest>=8"` |
-| `No module named pytest`（提示符已有 `(.venv)`） | 环境已激活，但 pytest 只装在全局环境；执行 `python -m pip install "pytest>=8"`，再用 `python -c "import sys; print(sys.executable)"` 确认解释器指向 `.venv` |
-| `source .venv/bin/activate` 报错（Windows） | Windows 的激活脚本在 `Scripts/` 下：`source ./.venv/Scripts/activate`；PowerShell 用 `.\.venv\Scripts\Activate.ps1` |
-| `python: command not found`（Git Bash） | 改用 `py -3.14`，或把 Python 安装目录加入 `PATH` |
-| Git Bash 中路径被 MSYS 改写 | 临时加 `MSYS_NO_PATHCONV=1`，例如 `MSYS_NO_PATHCONV=1 some-command` |
-| 一直停在 `waiting_approval` | 需要先 `approve(tool_call_id)`，再 `resume()`；模型需重新发起同一调用才会执行 |
-| `WorkspaceChanged` | 审批/证据绑定的指纹与当前工区不一致；重新读取文件并重新审批，或确认是否为预期变更 |
-| `UnknownResult` / `waiting_reconcile` | 上次写入结果未知；先 `reconcile()`，再 `resume()` |
-| `PolicyDenied`：已取消任务不可复活 | `cancel()` 后需新建 `GuardedHarness` 实例重新 `run()` |
-| `AuditAnchorError` / `verify()` 报「缺少头锚点」「尾部被截断」 | `audit.jsonl` 与 `audit.jsonl.head` 必须成对存在；删日志时要连 `.head` 一起删，截断后不能直接续写 |
-| `search_code` 报「包含嵌套量词」 | `(a+)+`、`(a*)*` 等会触发灾难性回溯，已被静态拒绝；改写为 `a+` 等非嵌套等价形式，或缩小 `path` |
-| `reject()` 后仍停在 `waiting_approval` | 说明还有其它待审批项；全部 `approve()` / `reject()` 处理完才会清除 `blocked`，之后 `resume()` 可继续 |
-| `duplicate_write` 出现在同一批次 | 同批同签名写入只允许执行一次；模型重复调用属预期拒绝，整批中止后重新规划即可 |
-| `test_s2_symlink_escape...` 被 skip | 该用例已改用 junction（`_winapi.CreateJunction`）实际执行，NTFS 上不再 skip；仅当文件系统不支持 junction（如 FAT/exFAT）时才会 skip |
-
----
-
-## 8. 项目目录结构（代码文件）
+## 7. 项目目录结构（代码文件）
 
 ```text
 guarded_coding_harness/
