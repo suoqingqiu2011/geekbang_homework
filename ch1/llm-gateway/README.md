@@ -1,8 +1,35 @@
 # LLM Gateway
 
-OpenAI 兼容的自建 LLM 网关：智能路由、容错（retry/fallback/circuit breaker）、分层限流、SSE 流式、结构化输出校验与自动修复、用量/追踪/计费（恰好一次）。
+OpenAI 兼容的自建 LLM 网关：统一接入多家供应商，提供智能路由、重试/降级/熔断、分层限流、SSE 流式、结构化输出校验与自动修复、模板管理，以及用量/追踪/计费（幂等）能力。
 
 规格依据：[docs/SPEC.md](../docs/SPEC.md)
+
+> 本文档中的示例命令均经过实际运行验证。PowerShell 与 Bash 命令请勿混用：续行符、引号和 JSON 转义规则不同。
+
+## 功能地图
+
+| 能力 | 实现位置 | 对外入口 |
+|---|---|---|
+| OpenAI 兼容对话 / 模型列表 | `app/api/chat.py` | `POST /v1/chat/completions`、`GET /v1/models` |
+| 智能路由与候选链 | `app/core/router.py` | 请求省略 `model` 时自动选路 |
+| 重试 / fallback / 熔断 | `app/core/retry_fallback.py`、`app/core/circuit_breaker.py` | 内部管道 |
+| 分层限流 | `app/core/rate_limiter.py` | `429 rate_limit_exceeded` |
+| Bearer 鉴权 | `app/core/auth.py` | 所有 `/v1/*` 管理类端点 |
+| 结构化输出校验与修复 | `app/core/validator.py` | `response_format` |
+| Prompt 注入检测 | `app/core/validator.py` | 消息内容命中规则即拒绝 |
+| 提示词模板 | `app/core/prompt_renderer.py`、`app/api/templates.py` | `/v1/templates`、`/ui/templates`、CLI |
+| 用量 / 追踪 / 计费 | `app/storage/metrics_store.py` | SQLite + CLI + `/v1/admin` |
+| 指标与健康检查 | `app/main.py`、`app/core/metrics_collector.py` | `/healthz`、`/readyz`、`/metrics` |
+| 配置加载与热更新 | `app/core/config_manager.py` | `config/gateway.yaml` + 环境变量 |
+| 运维 CLI | `cli/gateway_cli.py` | `python -m cli.gateway_cli ...` |
+
+### 请求管道
+
+```text
+鉴权 → 分层限流 → 请求校验 → Trace 固化 → Prompt 注入检测
+→ 模板渲染（可选）→ 路由 → 重试 / fallback → Provider 适配器
+→ 结构化输出校验 / 修复 → 幂等计费 → 响应（普通 / SSE）
+```
 
 ## 快速开始
 
@@ -52,15 +79,157 @@ curl http://127.0.0.1:8000/metrics
 curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-## 调用示例
+### 鉴权与 Provider Key
+
+网关准入使用统一 Bearer Key，来源优先级为 **环境变量 > `gateway.yaml`**：
+
+- `gateway.yaml` 的 `api_keys`（默认含 `sk-gateway-dev`、`sk-gateway-test`）；
+- 设置 `GATEWAY_API_KEYS`（逗号分隔）后，YAML 中的 key 被忽略。
+
+上游 Key 均从环境变量读取，不写入配置文件：
+
+| Provider | 环境变量 | 备注 |
+|---|---|---|
+| DeepSeek | `DEEPSEEK_API_KEY` | |
+| OpenAI | `OPENAI_API_KEY` | |
+| Kimi | `KIMI_API_KEY` | |
+| Qwen | `QWEN_API_KEY` | |
+| Anthropic | `ANTHROPIC_API_KEY` | |
+| Ollama | — | 本地服务，不配置 `api_key_env` |
+
+未配置 Key 的 Provider 会在路由阶段被剔除，不会发出非法请求，也不会计入熔断失败。
+
+## 配置说明
+
+### 配置文件结构
+
+配置位于 `config/gateway.yaml`，支持保存后**原子热更新**，无需重启：
+
+| 配置段 | 作用 |
+|---|---|
+| `server` | 监听地址、worker、日志、反向代理信任边界 |
+| `storage` | SQLite 路径、trace TTL、观察表保留天数 |
+| `rate_limit` | 令牌桶速率与各层上限 |
+| `circuit_breaker` | 失败阈值、恢复时间、半开探针数 |
+| `http_pool` | 连接池大小与上游超时 |
+| `api_keys` | 网关准入 Key |
+| `providers` | 供应商地址、Key 环境变量、价格、能力、模型别名 |
+| `available_models` | 对外模型名、所属供应商、路由权重、可选上下文窗口 |
+
+### 环境变量覆盖
+
+| 变量 | 覆盖项 |
+|---|---|
+| `GATEWAY_CONFIG_FILE` | 配置文件路径 |
+| `GATEWAY_API_KEYS` | 网关准入 Key 列表（逗号分隔） |
+| `GATEWAY_DB_PATH` | SQLite 路径 |
+| `GATEWAY_HOST` / `GATEWAY_PORT` / `GATEWAY_WORKERS` / `GATEWAY_LOG_LEVEL` | 服务监听与日志 |
+| `GATEWAY_TRUST_PROXY_HEADERS` / `GATEWAY_TRUSTED_PROXIES` | X-Forwarded-For 信任策略 |
+| `GATEWAY_RATE_REFILL` / `GATEWAY_RATE_BUCKET` | 令牌桶补充速率 / 容量 |
+| `GATEWAY_RATE_MODEL` / `GATEWAY_RATE_ENDPOINT` / `GATEWAY_RATE_PROJECT` / `GATEWAY_RATE_USER` | 分层限流上限 |
+| `GATEWAY_CB_THRESHOLD` / `GATEWAY_CB_RECOVERY` / `GATEWAY_CB_HALF_OPEN` | 熔断参数 |
+| `GATEWAY_POOL_CONNS` / `GATEWAY_POOL_KEEPALIVE` | 连接池容量 |
+| `GATEWAY_POOL_CONNECT_TO` / `GATEWAY_POOL_READ_TO` | 连接 / 读取超时 |
+| `GATEWAY_UNBILLED_RETENTION_DAYS` | 观察表保留天数 |
+
+### 供应商能力与默认价格
+
+| Provider | `structured_output` | prompt 单价（$/M） | completion 单价（$/M） | thinking 能力 |
+|---|---|---|---|---|
+| deepseek | `json_object` | 0.5 | 2.0 | 0.8 |
+| openai | `json_schema` | 2.5 | 10.0 | 0.9 |
+| kimi | `json_object` | 1.0 | 3.5 | 0.85 |
+| qwen | `json_object` | 0.8 | 3.0 | 0.75 |
+| anthropic | `none` | 3.0 | 15.0 | 0.95 |
+| ollama | `json_object` | 0.0 | 0.0 | 0.4 |
+
+`structured_output` 决定网关如何向上游传递 `response_format`：`json_schema` 原样透传；`json_object` 降级为 JSON 对象模式并补充提示词；`none` 不转发原生约束，由适配器用提示方式兜底。本地 validator 始终是最终校验权威。
+
+### 上游超时：只有 `http_pool.read_timeout` 生效
+
+`providers.<name>.timeout` 目前**只被解析、未接线**（`ProviderConfig.timeout` 无任何消费方），改它不会影响实际超时。所有上游调用共用一个连接池超时：
+
+```yaml
+http_pool:
+  connect_timeout: 5.0
+  read_timeout: 60.0     # 真正生效的上游超时
+```
+
+env 覆盖：`GATEWAY_POOL_CONNECT_TO` / `GATEWAY_POOL_READ_TO`。修改后由配置监听热重载，`http_pool.update_params()` 会重建客户端，**无需重启**。
+
+为避免"改了却没生效"，配置加载时若显式写了 `providers.<name>.timeout` 且与 `http_pool.read_timeout` 不一致，会打印 warning：
+
+```text
+WARNING Provider 'deepseek' 的 timeout=0.001s 不会生效：上游超时统一由
+        http_pool.read_timeout=60.000s 控制（env GATEWAY_POOL_READ_TO）
+```
+
+该提示**只告警、不改变任何行为**（`ProviderConfig.timeout` 仍按配置保存）。
+
+### 计费与定价（prompt / completion 分价）
+
+供应商支持按 prompt / completion 分别定价（两者单价通常相差数倍）：
+
+```yaml
+providers:
+  deepseek:
+    cost_prompt_per_million_tokens: 0.5
+    cost_completion_per_million_tokens: 2.0
+```
+
+- 配置了分价时，**计费、预算预检、路由加权价**均使用分价；只写 `cost_per_million_tokens`（单一均价）时，两价回退为该值，兼容旧配置。
+- 单次成本 = `prompt_tokens/1e6 × prompt单价 + completion_tokens/1e6 × completion单价`，落库到 `usage_metrics.cost_usd`，并累计进 `daily_aggregates`。
+- 三个价格字段全部缺失时会打印 warning 并按 `$1/M` 计费（避免静默按 0 计费）。
+- 上游未返回 usage 的请求按估算 token 记录，并标记 `estimated=1`、`cost_usd=0`，因此日报成本可能偏低；精确账单以返回 usage 的请求为准。
+
+`daily`（CLI 与 `/v1/admin/daily`）已按 `prompt_tokens` / `completion_tokens` 分列累计。
+
+## API 参考
+
+### 端点总览
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/v1/models` | Bearer | 列出对外可用模型 |
+| POST | `/v1/chat/completions` | Bearer | 对话补全（普通 / 流式 / 结构化输出） |
+| GET/POST/DELETE | `/v1/templates...` | Bearer | 模板管理，详见下文 |
+| GET | `/v1/admin/summary` | Bearer | 累计用量概览 |
+| GET | `/v1/admin/traces` | Bearer | 最近追踪记录 |
+| GET | `/v1/admin/daily` | Bearer | 按天聚合用量与成本 |
+| GET | `/healthz` | 无 | 存活探针 |
+| GET | `/readyz` | 无 | 就绪探针 |
+| GET | `/metrics` | 无 | Prometheus 文本指标 |
+| GET | `/ui/templates` | 无（页面本身） | 模板管理单页，数据操作仍需 Bearer |
+
+### 请求字段（`POST /v1/chat/completions`）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `model` | string，可选 | 省略时自动选路；显式指定则只走该模型 |
+| `messages` | array | 必填，1~64 条；`role` 支持 system/user/assistant/tool |
+| `stream` | bool | 是否 SSE 流式 |
+| `temperature` | float，0~2 | 采样温度 |
+| `max_tokens` | int，1~32768 | 最大生成 token 数 |
+| `response_format` | object | `json_object` 或 `json_schema` |
+| `top_p` | float，0~1 | 核采样 |
+| `stop` | string / string[] | 最多 4 条，不可为空串 |
+| `presence_penalty` | float，-2~2 | 话题新鲜度惩罚 |
+| `frequency_penalty` | float，-2~2 | 词频惩罚 |
+| `seed` | int | 尽力而为的可复现种子 |
+| `logprobs` | bool | 返回 token 对数概率，仅非流式生效 |
+| `top_logprobs` | int，0~20 | 需同时 `logprobs: true` |
+| `user` | string | 用户标识，默认 `anonymous` |
+| `project` | string | 项目标识，默认 `default`；参与限流与预算累计 |
+| `budget_usd` | float | 项目预算；`0` 表示不限制 |
+| `thinking` | bool | 要求更高思考能力，路由时提高能力权重 |
+| `trace_id` | string，可选 | 调用方指定追踪 ID |
+| `template_id` | string，可选 | 引用提示词模板 |
+| `template_version` | int，可选 | 模板版本，缺省最新 |
+| `template_vars` | object | 模板变量；设置 `template_id` 时必填 |
+
+> `model` 为可选字段。省略时网关在**全部已配置 Key 的候选**里按「成本 + 思考能力」评分自动选路，**可能命中任意供应商**（如 qwen / kimi / anthropic），并非固定走 deepseek。响应体的 `model` 字段会回显实际命中的模型。需要固定供应商/模型时，请显式传 `model`，取值范围见 `config/gateway.yaml` 的 `available_models`（如 `deepseek-chat`、`qwen-max`）。下方示例均显式指定 `model`，便于复现。
 
 ### 普通对话（非流式）
-
-> **`model` 为可选字段。** 省略时网关在**全部已配置 Key 的候选**里按「成本 + 思考能力」
-> 评分自动选路，**可能命中任意供应商**（如 qwen / kimi / anthropic），并非固定走
-> deepseek。响应体的 `model` 字段会回显实际命中的模型。需要固定供应商/模型时，
-> 请显式传 `model`，取值范围见 `config/gateway.yaml` 的 `available_models`
-> （如 `deepseek-chat`、`qwen-max`）。下方示例均显式指定 `model`，便于复现。
 
 **Windows（PowerShell）：** 多行命令用反引号 `` ` `` 续行；JSON Body 先写入临时文件再通过 `--data-binary` 发送（避免引号转义问题）。
 
@@ -74,13 +243,7 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS / Git Bash：** 单引号包裹 JSON、`\` 续行，无需临时文件。
-`-sS` 静默进度但保留错误输出（连接失败时可看到 `Failed to connect`），
-`-i` 打印响应状态码与头（便于区分 401 invalid_auth / 200 OK 等）。
-网关准入 Key 必须是 `.env` 中 `GATEWAY_API_KEYS` 内的值，如 `sk-gateway-dev`
-（`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）。如需让测试 Key
-（如 `sk-test`）也可用，可在 `.env` 中追加后重启服务：
-`GATEWAY_API_KEYS=sk-gateway-dev,sk-gateway-test,sk-test`；生产环境不建议保留此类弱 Key (`sk-test`)。
+**Linux / macOS / Git Bash：** 单引号包裹 JSON、`\` 续行，无需临时文件。`-sS` 静默进度但保留错误输出（连接失败时可看到 `Failed to connect`），`-i` 打印响应状态码与头（便于区分 401 invalid_auth / 200 OK 等）。网关准入 Key 必须是 `.env` 中 `GATEWAY_API_KEYS` 内的值，如 `sk-gateway-dev`（`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）。如需让测试 Key（如 `sk-test`）也可用，可在 `.env` 中追加后重启服务：`GATEWAY_API_KEYS=sk-gateway-dev,sk-gateway-test,sk-test`；生产环境不建议保留此类弱 Key (`sk-test`)。
 
 ```bash
 curl -sS -i http://localhost:8000/v1/chat/completions \
@@ -102,8 +265,7 @@ curl -sS http://localhost:8000/v1/chat/completions \
 
 ### 采样参数（top_p / stop / penalties / seed）
 
-除 `temperature` / `max_tokens` / `response_format` 外，请求体还支持以下**可选**采样参数。
-均可不传；**不传时上游请求体与改造前完全一致**（严格向后兼容）：
+除 `temperature` / `max_tokens` / `response_format` 外，请求体还支持以下**可选**采样参数。均可不传；**不传时上游请求体与改造前完全一致**（严格向后兼容）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -123,25 +285,15 @@ curl -sS http://localhost:8000/v1/chat/completions \
         "top_p":0.9,"stop":["END"],"presence_penalty":0.1,"frequency_penalty":0.2,"seed":42}'
 ```
 
-> **供应商差异**：OpenAI 兼容供应商原样透传全部字段；Anthropic 仅支持 `top_p` 与
-> `stop`（映射为 `stop_sequences`，最多 4 条），`presence_penalty` /
-> `frequency_penalty` / `seed` / `logprobs` / `top_logprobs` 会被显式忽略
-> （仅记录 debug 日志，不返回错误）。
+> **供应商差异**：OpenAI 兼容供应商原样透传全部字段；Anthropic 仅支持 `top_p` 与 `stop`（映射为 `stop_sequences`，最多 4 条），`presence_penalty` / `frequency_penalty` / `seed` / `logprobs` / `top_logprobs` 会被显式忽略（仅记录 debug 日志，不返回错误）。
 >
-> `top_logprobs` 上限 20，且必须与 `logprobs: true` 同时使用，否则返回
-> `400 invalid_request`（与 OpenAI 行为一致，同时避免响应体积被放大）。
-> 未请求 logprobs 时，响应中仍保留 `choices[0].logprobs: null`（对齐 OpenAI 原生行为）。
-> 流式请求暂不支持 logprobs，传入会被忽略。
+> `top_logprobs` 上限 20，且必须与 `logprobs: true` 同时使用，否则返回 `400 invalid_request`。未请求 logprobs 时，响应中仍保留 `choices[0].logprobs: null`（对齐 OpenAI 原生行为）。流式请求暂不支持 logprobs，传入会被忽略。
 >
-> 其余未声明字段（如 `tools`、`n`）仍按「忽略」处理而非报错，避免破坏既有客户端；
-> 因此这类参数**不会生效**，需要时请见「设计说明 → 后续升级方向」。
+> 其余未声明字段（如 `tools`、`n`）仍按「忽略」处理而非报错，避免破坏既有客户端；因此这类参数**不会生效**。
 
-### logprobs：用途、边界与使用案例
+### logprobs：用途与边界
 
-`logprobs` 返回模型生成每个 token 时**采样前的条件概率**（对数形式）：
-`p = exp(logprob)`，越接近 0 越确定。它描述"模型有多确信"，**不描述"答案是否正确"**。
-
-**用途**
+`logprobs` 返回模型生成每个 token 时**采样前的条件概率**（对数形式）：`p = exp(logprob)`，越接近 0 越确定。它描述"模型有多确信"，**不描述"答案是否正确"**。
 
 | 用途 | 做法 |
 |---|---|
@@ -150,17 +302,14 @@ curl -sS http://localhost:8000/v1/chat/completions \
 | 提示词歧义检测 | 看 `top_logprobs` 前二候选差距；`< 1.0 nat`（概率差 < 2.7 倍）说明模型在摇摆 |
 | 版本回归对比 | 同 prompt、同模型跨版本比较几何平均 logprob；**跨模型不可比**（tokenizer 切分不同） |
 
-**边界**
+关键边界：
 
 - **高概率 ≠ 正确**：模型可以"自信地错"，不能替代 `response_format` 校验。
 - **条件概率**：整段 `sum(logprob)` 随长度变负，比较长短回答时要用几何平均 `exp(-sum/len)`。
 - **top-N 截断**：`top_logprobs` 只返回前 N 名，未列出的候选概率总和可能仍不小。
-- **协议限制**：仅非流式生效（流式传入会被忽略）；Anthropic 显式忽略并返回 `logprobs: null`；
-  部分 OpenAI 兼容供应商即便请求也不返回该字段，网关**原样透传、不伪造**。
+- **协议限制**：仅非流式生效；Anthropic 显式忽略并返回 `logprobs: null`；部分 OpenAI 兼容供应商即便请求也不返回该字段，网关**原样透传、不伪造**。
 - **结构差异**：`logprobs.content` 数组长度 ≠ 字符串长度，首 token 常带前导空格。
 - **安全**：等于暴露模型输出分布（可用于蒸馏/提取），多租户对外时应纳入 Key 级能力白名单。
-
-**使用案例**
 
 ```bash
 curl -sS http://localhost:8000/v1/chat/completions \
@@ -219,8 +368,7 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），
-规避 Windows Git Bash 把命令行参数中的中文按 GBK 编码、导致服务端 JSON 解析失败。
+**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），规避 Windows Git Bash 把命令行参数中的中文按 GBK 编码、导致服务端 JSON 解析失败。
 
 ```bash
 curl -sS -X POST http://localhost:8000/v1/chat/completions \
@@ -233,6 +381,8 @@ curl -sS -X POST http://localhost:8000/v1/chat/completions \
    "schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}
 JSON
 ```
+
+非流式路径在返回前完成校验，并尝试自动修复（如提取首个平衡的 `{...}` / `[...]` 块）。仍不通过则按可重试错误进入重试 / fallback；全部失败返回 `502 structured_output_failed`。
 
 ### 流式输出（Server-Sent Events）
 
@@ -251,8 +401,7 @@ curl.exe -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" `
   --data-binary "@$env:TEMP\req.json"
 ```
 
-**Linux / macOS / Git Bash：** `-N` 用于关闭缓冲，逐行输出 SSE 事件。body 走 stdin，
-避免中文参数被 shell 按 GBK 转码：
+**Linux / macOS / Git Bash：** `-N` 用于关闭缓冲，逐行输出 SSE 事件。body 走 stdin，避免中文参数被 shell 按 GBK 转码：
 
 ```bash
 curl -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" \
@@ -263,19 +412,13 @@ curl -s -N -X POST "http://127.0.0.1:8000/v1/chat/completions" \
 JSON
 ```
 
-> **Windows Git Bash 必读**：不要写成 `-d '...中文...'`。中文 Windows 下该参数会按
-> GBK/CP936 传给 curl，服务端收到非法 UTF-8，在进入业务逻辑前就返回
-> `400 {"detail":"There was an error parsing the body"}`（与流式输出无关）。
-> 请使用上面的 stdin 写法，或先把 JSON 存为 UTF-8 文件再 `--data-binary @req.json`。
+> **Windows Git Bash 必读**：不要写成 `-d '...中文...'`。中文 Windows 下该参数会按 GBK/CP936 传给 curl，服务端收到非法 UTF-8，在进入业务逻辑前就返回 `400 {"detail":"There was an error parsing the body"}`（与流式输出无关）。请使用上面的 stdin 写法，或先把 JSON 存为 UTF-8 文件再 `--data-binary @req.json`。
 
-响应为多条 `data: {...}` 事件，末行 `data: [DONE]` 表示结束。也可直接使用 Swagger UI
-交互式测试：浏览器打开 `http://127.0.0.1:8000/docs`。
+响应为多条 `data: {...}` 事件，末行 `data: [DONE]` 表示结束。也可直接使用 Swagger UI 交互式测试：浏览器打开 `http://127.0.0.1:8000/docs`。
 
 ### 流式 + 结构化输出（validation 事件契约）
 
-当请求同时满足 `stream:true` 且携带 `response_format`（结构化输出）时，网关会在正常
-chunk 事件之后、`[DONE]` 之前追加**一条** `validation` 事件，供调用方判断整段流式输出
-是否通过 schema 校验。
+当请求同时满足 `stream:true` 且携带 `response_format`（结构化输出）时，网关会在正常 chunk 事件之后、`[DONE]` 之前追加**一条** `validation` 事件，供调用方判断整段流式输出是否通过 schema 校验。
 
 | 字段 | 值 | 说明 |
 |---|---|---|
@@ -296,12 +439,9 @@ data: [DONE]
 
 > 普通对话流（未携带 `response_format`）**不会**发送 `validation` 事件，事件序列与 OpenAI 官方一致。
 
-**语义与取舍：** 流式下 delta 已逐块透传给客户端，因此校验只能**事后进行、无法自动修复**；
-`status:"error"` 表示整段拼接内容不合 schema，调用方应丢弃本次结果或按业务重试。非流式路径
-则在返回前校验并尝试自动修复，失败会重试/fallback——两者行为不同，需分别处理。
+**语义与取舍：** 流式下 delta 已逐块透传给客户端，因此校验只能**事后进行、无法自动修复**；`status:"error"` 表示整段拼接内容不合 schema，调用方应丢弃本次结果或按业务重试。非流式路径则在返回前校验并尝试自动修复，失败会重试/fallback——两者行为不同，需分别处理。
 
-**示例（Bash / Git Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），
-避免 Windows 控制台把参数中的中文转成 GBK 导致服务端 JSON 解析失败。
+**示例（Bash / Git Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），避免 Windows 控制台把参数中的中文转成 GBK 导致服务端 JSON 解析失败。
 
 ```bash
 curl -sS -N http://localhost:8000/v1/chat/completions \
@@ -316,13 +456,12 @@ curl -sS -N http://localhost:8000/v1/chat/completions \
 JSON
 ```
 
-### 模板管理 HTTP 端点（/v1/templates）
+### 模板管理 HTTP 端点（`/v1/templates`）
 
-模板管理原本仅 CLI 可用（`python -m cli.gateway_cli templates ...`），现已暴露为
-REST 端点，复用网关统一 Bearer 鉴权（默认 key 见 `config/gateway.yaml` 的 `api_keys`；
-若设置了 `GATEWAY_API_KEYS` 环境变量，则以环境变量为准，YAML 中的 key 被忽略）。
+模板管理原本仅 CLI 可用（`python -m cli.gateway_cli templates ...`），现已暴露为 REST 端点，复用网关统一 Bearer 鉴权（默认 key 见 `config/gateway.yaml` 的 `api_keys`；若设置了 `GATEWAY_API_KEYS` 环境变量，则以环境变量为准，YAML 中的 key 被忽略）。
 
 语义约定：
+
 - 每次 `POST` upsert 自动自增 `version` 并保留历史版本；
 - **模板不存在 → 404 `not_found`**（GET/DELETE/render/chat 引用均一致）；
 - **输入类错误 → 400**：缺模板变量 `prompt_missing_vars`、模板语法错误/参数校验失败 `invalid_request`。
@@ -336,27 +475,21 @@ REST 端点，复用网关统一 Bearer 鉴权（默认 key 见 `config/gateway.
 | POST | `/v1/templates/{id}/render` | 用变量预览渲染结果（不调用上游） |
 | DELETE | `/v1/templates/{id}` | 删除；`?version=N` 删单版本，缺省删全部（响应含 `deleted` 数量） |
 
-**网页管理界面：** 网关内置了一个零依赖的单文件管理页（增删改查 + 版本查看 +
-渲染预览），由网关同源提供，浏览器打开即用、无跨域问题：
+**网页管理界面：** 网关内置了一个零依赖的单文件管理页（增删改查 + 版本查看 + 渲染预览），由网关同源提供，浏览器打开即用、无跨域问题：
 
-```
+```text
 http://127.0.0.1:8000/ui/templates        # 友好短路径
 http://127.0.0.1:8000/ui/templates.html   # 等价（静态挂载）
 ```
 
-页面顶部填入网关 API Key（须为 `.env` 中 `GATEWAY_API_KEYS` 内的值，如
-`sk-gateway-dev`；`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）后点
-「保存并测试」，后续所有操作自动携带 `Authorization: Bearer ...` 头。Key 仅保存在
-浏览器 `localStorage`，数据操作仍受 `/v1/templates` 统一鉴权保护。HTML 本身可匿名
-访问，页面源码见 `app/static/templates.html`。
+页面顶部填入网关 API Key（须为 `.env` 中 `GATEWAY_API_KEYS` 内的值，如 `sk-gateway-dev`；`sk-test` 等未在名单中的 Key 会返回 `401 invalid_auth`）后点「保存并测试」，后续所有操作自动携带 `Authorization: Bearer ...` 头。Key 仅保存在浏览器 `localStorage`，数据操作仍受 `/v1/templates` 统一鉴权保护。HTML 本身可匿名访问，页面源码见 `app/static/templates.html`。
 
 ![模板管理页面示例](../docs/tpl_greet_1.png)
 
-**Windows（PowerShell）：** body 通过 here-string 走 stdin（`--data-binary "@-"`），与下面的 Bash heredoc 一一对应。
-PS 5.1 的管道默认按 ASCII 编码，中文会变成 `?`，故先统一管道编码为 UTF-8（不带 BOM）：
+**Windows（PowerShell）：** body 通过 here-string 走 stdin（`--data-binary "@-"`），与下面的 Bash heredoc 一一对应。PS 5.1 的管道默认按 ASCII 编码，中文会变成 `?`，故先统一管道编码为 UTF-8（不带 BOM）：
 
 - `--data-binary "@-"` 的引号不能省：`@` 在 PowerShell 中是保留字符，裸写 `@-` 会报语法错误；
-- `$OutputEncoding` 只影响“字符串 → 原生程序 stdin”，不影响控制台显示；
+- `$OutputEncoding` 只影响"字符串 → 原生程序 stdin"，不影响控制台显示；
 - 用 `New-Object System.Text.UTF8Encoding($false)` 保证不带 BOM；
 - 若忘了这一步，中文 body 会得到 `400 {"detail":"There was an error parsing the body"}`。
 
@@ -406,10 +539,7 @@ curl.exe -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" `
 curl.exe -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin，与上面的 PowerShell here-string 一一对应；
-heredoc 直接按 UTF-8 写入 stdin，**无需**像 PowerShell 那样额外设置管道编码。
-若在 **Windows Git Bash** 中直接把中文写进 `-d '...'`，命令行参数会被按 GBK 编码传入，
-服务端收到非 UTF-8 字节 → `400 {"detail":"There was an error parsing the body"}`。
+**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin，与上面的 PowerShell here-string 一一对应；heredoc 直接按 UTF-8 写入 stdin，**无需**像 PowerShell 那样额外设置管道编码。若在 **Windows Git Bash** 中直接把中文写进 `-d '...'`，命令行参数会被按 GBK 编码传入，服务端收到非 UTF-8 字节 → `400 {"detail":"There was an error parsing the body"}`。
 
 ```bash
 # 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
@@ -440,6 +570,7 @@ curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
 {"variables":{"role":"销售","question":"报价策略"}}
 JSON
 ```
+
 ```bash
 # 5b) 排查接口本身（纯 ASCII，不依赖命令行参数编码）
 curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
@@ -449,6 +580,7 @@ curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
 {"variables":{"role":"sales","question":"pricing"}}
 JSON
 ```
+
 ```bash
 # 6) 删除（?version=1 删指定版本；缺省删全部）
 curl -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" \
@@ -456,14 +588,9 @@ curl -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" \
 curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-> body 统一用 `--data-binary @- <<'JSON'` 走 stdin（纯 ASCII 同理），避免 `-d '...'` 的引号/转义
-> 在跨 shell 粘贴时出错。**不要把 PowerShell 命令直接粘进 Git Bash**：续行符是 `\` 而不是反引号，
-> JSON 内也不要写 `\"` 转义；反引号在 Bash 中是命令替换，会报 `-H: command not found`，
-> curl 最终因缺少 body 得到 422 `{"type":"missing","loc":["body"],"msg":"Field required"}`。
+> body 统一用 `--data-binary @- <<'JSON'` 走 stdin（纯 ASCII 同理），避免 `-d '...'` 的引号/转义在跨 shell 粘贴时出错。**不要把 PowerShell 命令直接粘进 Git Bash**：续行符是 `\` 而不是反引号，JSON 内也不要写 `\"` 转义；反引号在 Bash 中是命令替换，会报 `-H: command not found`，curl 最终因缺少 body 得到 422 `{"type":"missing","loc":["body"],"msg":"Field required"}`。
 
-聊天中引用模板：在 `POST /v1/chat/completions` 请求体中通过扩展字段
-`template_id` / `template_version`（缺省最新）/ `template_vars` 注入，渲染结果作为
-system 消息参与对话：
+聊天中引用模板：在 `POST /v1/chat/completions` 请求体中通过扩展字段 `template_id` / `template_version`（缺省最新）/ `template_vars` 注入，渲染结果作为 system 消息参与对话：
 
 ```json
 {"model":"deepseek-chat",
@@ -472,64 +599,62 @@ system 消息参与对话：
  "template_vars":{"role":"销售","question":"报价策略"}}
 ```
 
-与 CLI 的分工：**HTTP 端点适合在线管理**（需要网关运行中，走统一 Bearer 鉴权）；
-**CLI 适合离线运维**（无需启动网关，直接操作 SQLite）。CLI 用法见
-「CLI 运维 → 模板管理（CLI）」。
+与 CLI 的分工：**HTTP 端点适合在线管理**（需要网关运行中，走统一 Bearer 鉴权）；**CLI 适合离线运维**（无需启动网关，直接操作 SQLite）。CLI 用法见「CLI 运维 → 模板管理（CLI）」。
 
-## 测试
+## 核心机制
 
-`tests/` 内的测试均为 **E2E（全 mock）+ 单测**：通过 `conftest.py` 启动一个模拟的
-LLM 上游服务（`tests/mock_upstream.py`），并为每个用例创建指向该 mock 的网关实例。
-**无需真实 Provider API Key，不访问外部网络。**
+### 智能路由
 
-> 注意：请务必使用虚拟环境中的解释器（Windows 为 `.\.venv\Scripts\python.exe`，
-> Linux/macOS 为 `.venv/bin/python`），不要用系统 `python`（系统解释器未安装
-> pytest，会报 `No module named pytest`）。
+- 候选来自 `available_models`，按「成本 + 思考能力」评分：成本归一化后与能力缺口加权，再除以 `routing_weight`，分数越低越优先。
+- 请求带 `thinking: true` 时提高能力权重（成本让位）。
+- 硬过滤依次为：显式 `model` 匹配、缺失 Key、熔断 OPEN、上下文窗口（软过滤，全部超限时回退全量）、预算（按 `max_tokens` 预估最大成本）。
+- 请求未指定 `model` 时，路由确定首选模型后会补检 per-model 限流层。
+- 所有候选都被过滤：无可用模型返回 `503 model_unavailable`，预算不足返回 `402 budget_exhausted`。
 
-运行全部测试：
+### 重试与降级
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests -v
-```
+- 可重试：`408`、`425`、`429`、`5xx`、超时与常见网络错误；默认最多 3 次，指数退避（0.5s 起、上限 8s、20% 抖动）。
+- 认证失败（上游 401/403）不重试，对外统一映射为 `502`，不泄漏上游鉴权细节。
+- 缺少 Key 视为配置问题：跳过该候选、不重试、不计入熔断。
+- 单候选重试耗尽后切换下一候选；流式请求一旦某候选成功即停止，避免多个供应商的内容拼接。
+- 流式首 token 后断流会记录 `partial_failed`，并计入熔断失败；客户端断连记录 `cancelled`，不计费。
 
-只运行某个文件 / 某个用例：
+### 熔断
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests/test_api.py -v
-.\.venv\Scripts\python.exe -m pytest tests/test_rate_limiter.py::test_token_bucket_capacity -v
-```
+按 Provider 维护状态机 `CLOSED → OPEN → HALF_OPEN → CLOSED/OPEN`，状态持久化在 SQLite，跨 worker 一致。默认连续失败 5 次打开，30 秒后进入半开并最多放行 3 个探针请求。路由前与每次上游调用前都会检查。
 
-带覆盖率：
+### 分层限流
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests -v --cov=app --cov-report=term
-```
+令牌桶按四层检查，**最严格者生效**：`per-model > per-endpoint > per-project > per-user`。请求被拒返回 `429 rate_limit_exceeded`（含 `retry_after`），且不消耗任何层的令牌；桶缓存有 LRU 上限，防止随机 key 造成内存增长。
 
-### 常见问题：上游请求全部返回 502
+### 结构化输出与 Prompt 注入防护
 
-若所有发往 mock 上游的用例（`test_chat_completion_nonstream` 等）都报
-`Upstream error 502`，通常是 **Windows 系统代理**在作祟：httpx 默认 `trust_env=True`
-会把对本地 `127.0.0.1` 端口的上游请求转发给系统代理，代理返回 502。
+- 按 Provider 能力降级 `response_format`：`json_schema` 原样透传；`json_object` 追加 JSON 提示词并注入完整 schema；`none` 由适配器用提示约束兜底。
+- 本地 validator 是唯一校验权威：先严格解析，失败后尝试提取平衡的 `{...}` / `[...]` 块自动修复；仍失败则重试 / fallback。
+- 上游对 `response_format` 返回 400 时，去掉该参数并补充 JSON 提示词重试一次。
+- schema 校验器按 LRU 缓存（上限 256），防止恶意唯一 schema 撑爆内存。
+- 消息中命中角色伪装、指令覆盖等启发式规则时返回 `400 prompt_injection_detected`；该机制是启发式防护，不是绝对安全边界。
 
-修复方式：网关上行的 HTTP 客户端禁用系统代理（`SharedHttpClientPool` 中已处理，
-见 `app/core/http_client_pool.py`）：
+### 计费与追踪
 
-```python
-httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
-```
+成功请求按实际 usage 与分价写入 `usage_metrics`，并同步累计 `daily_aggregates`；`billing_id` 不含 attempt 序号，客户端用同一 `billing_id` 重试不会重复计费。trace 记录请求快照、状态、provider/model、耗时、TTFT、尝试次数与成本；流式记录 TTFT 与半程状态。
 
-### 常见问题：`{"detail":"There was an error parsing the body"}`
+## 错误码
 
-该 400 由 FastAPI 解析 body 阶段抛出，说明服务端收到的**不是合法 UTF-8 JSON**，
-与鉴权、schema 无关（因此不会返回 `invalid_auth` / `invalid_request`）。
-最常见原因：在中文 Windows 的 Git Bash / PowerShell 里用 `curl -d '...中文...'`，
-命令行参数被按 ANSI 代码页（GBK/CP936）传给 curl，body 变成非法 UTF-8。
-
-规避方式（任选其一）：
-
-1. body 走 stdin：`curl ... --data-binary @- <<'JSON' ... JSON`（推荐，见上方示例）；
-2. 先把 JSON 写成**无 BOM 的 UTF-8** 文件，再 `--data-binary @req.json`（PS 5.1 的 `-Encoding UTF8` 会带 BOM，推荐用 .NET `WriteAllText`）；
-3. 控制台切 UTF-8 代码页（`chcp.com 65001`），或示例内容改用 ASCII。
+| HTTP | `code` | 场景 |
+|---|---|---|
+| 400 | `invalid_request` | 请求体校验失败、采样参数非法 |
+| 400 | `prompt_missing_vars` | 模板变量缺失 |
+| 400 | `prompt_injection_detected` | 命中注入启发式规则 |
+| 401 | `invalid_auth` | 网关 Key 不在准入名单 |
+| 402 | `budget_exhausted` | 预算不足，无候选可承接 |
+| 404 | `not_found` | 模板不存在 |
+| 429 | `rate_limit_exceeded` | 任一层限流触发 |
+| 502 | `upstream_error` | 上游错误且重试/降级均失败 |
+| 502 | `structured_output_failed` | 上游 200 但结构校验失败 |
+| 503 | `model_unavailable` | 无可用候选（Key/熔断/显式模型不可用） |
+| 504 | `upstream_timeout` | 上游超时 |
+| 500 | `internal_error` | 未预期异常 |
 
 ## 可观测性与健康检查
 
@@ -541,9 +666,7 @@ httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 | `GET /readyz` | **就绪**探针：校验配置已加载、SQLite 可读写、连接池已初始化 | `200` / `503` + 逐项 `checks` |
 | `GET /metrics` | Prometheus 文本格式指标 | `text/plain; version=0.0.4` |
 
-两者分工：容器 `HEALTHCHECK` 用 `/healthz`（避免 SQLite 抖动误杀容器）；负载均衡 /
-外部探针用 `/readyz`。Provider 缺 Key 只在 `providers.missing_key` 中降级提示，
-**不判定为 503**（属配置问题而非进程故障）。
+两者分工：容器 `HEALTHCHECK` 用 `/healthz`（避免 SQLite 抖动误杀容器）；负载均衡 / 外部探针用 `/readyz`。Provider 缺 Key 只在 `providers.missing_key` 中降级提示，**不判定为 503**（属配置问题而非进程故障）。
 
 ```bash
 curl -sS http://localhost:8000/readyz
@@ -565,13 +688,11 @@ curl -sS http://localhost:8000/metrics
 | `llm_gateway_uptime_seconds` | gauge | 进程运行时长 |
 | `llm_gateway_build_info{version}` | gauge | 构建版本（恒为 1） |
 
-> 指标为**每进程视角**：多 worker 部署时各 worker 独立计数，`/metrics` 每次只命中单个
-> worker；跨进程的精确历史数据仍以 SQLite（`usage_metrics` / `daily_aggregates`）与 CLI 为准。
+> 指标为**每进程视角**：多 worker 部署时各 worker 独立计数，`/metrics` 每次只命中单个 worker；跨进程的精确历史数据仍以 SQLite（`usage_metrics` / `daily_aggregates`）与 CLI 为准。
 
-### 指标只读查询端点（/v1/admin）
+### 指标只读查询端点（`/v1/admin`）
 
-与 CLI 查询同一份 SQLite 数据，但可被脚本/看板直接调用。**需要 Bearer 鉴权**，
-纯只读，查询规模有硬上限，不提供任何写操作。
+与 CLI 查询同一份 SQLite 数据，但可被脚本/看板直接调用。**需要 Bearer 鉴权**，纯只读，查询规模有硬上限，不提供任何写操作。
 
 | 端点 | 说明 | 关键参数 |
 |---|---|---|
@@ -589,9 +710,7 @@ curl -sS "http://localhost:8000/v1/admin/daily?days=7" -H "Authorization: Bearer
 
 ### 客户端 IP 与反向代理（X-Forwarded-For）
 
-trace 中的 `client_ip` **默认取 TCP 对端地址，不采信 `X-Forwarded-For`**，避免调用方
-伪造审计来源。相关配置在 `gateway.yaml` 的 `server` 段（或用 `GATEWAY_TRUST_PROXY_HEADERS`
-/ `GATEWAY_TRUSTED_PROXIES` 覆盖）：
+trace 中的 `client_ip` **默认取 TCP 对端地址，不采信 `X-Forwarded-For`**，避免调用方伪造审计来源。相关配置在 `gateway.yaml` 的 `server` 段（或用 `GATEWAY_TRUST_PROXY_HEADERS` / `GATEWAY_TRUSTED_PROXIES` 覆盖）：
 
 ```yaml
 server:
@@ -601,90 +720,23 @@ server:
     - "::1"
 ```
 
-部署在 nginx / 负载均衡之后时**必须**开启并登记代理地址，否则所有请求的 `client_ip`
-都会变成代理自身地址（如 `127.0.0.1`）。开启后从右向左跳过可信代理，取第一个非可信
-地址作为客户端 IP（左侧条目可被客户端任意伪造，因此不会被采用）；非法地址会被忽略并
-回落对端地址。
-
-### 计费与定价（prompt/completion 分价）
-
-供应商支持按 prompt / completion 分别定价（两者单价通常相差数倍）：
-
-```yaml
-providers:
-  deepseek:
-    cost_prompt_per_million_tokens: 0.5
-    cost_completion_per_million_tokens: 2.0
-```
-
-- 配置了分价时，**计费、预算预检、路由加权价**均使用分价；只写 `cost_per_million_tokens`
-  （单一均价）时，两价回退为该值，兼容旧配置。
-- 单次成本 = `prompt_tokens/1e6 × prompt单价 + completion_tokens/1e6 × completion单价`，
-  落库到 `usage_metrics.cost_usd`，并累计进 `daily_aggregates`。
-- 三个价格字段全部缺失时会打印 warning 并按 `$1/M` 计费（避免静默按 0 计费）。
-- 上游未返回 usage 的请求按估算 token 记录，并标记 `estimated=1`、`cost_usd=0`，
-  因此日报成本可能偏低；精确账单以返回 usage 的请求为准。
-
-`daily`（CLI 与 `/v1/admin/daily`）已按 `prompt_tokens` / `completion_tokens` 分列累计。
-
-### 上游超时：只有 `http_pool.read_timeout` 生效
-
-`providers.<name>.timeout` 目前**只被解析、未接线**（`ProviderConfig.timeout` 无任何消费方），
-改它不会影响实际超时。所有上游调用共用一个连接池超时：
-
-```yaml
-http_pool:
-  connect_timeout: 5.0
-  read_timeout: 60.0     # 真正生效的上游超时
-```
-
-env 覆盖：`GATEWAY_POOL_CONNECT_TO` / `GATEWAY_POOL_READ_TO`。修改后由配置监听热重载，
-`http_pool.update_params()` 会重建客户端，**无需重启**。
-
-为避免"改了却没生效"，配置加载时若显式写了 `providers.<name>.timeout` 且与
-`http_pool.read_timeout` 不一致，会打印 warning：
-
-```
-WARNING Provider 'deepseek' 的 timeout=0.001s 不会生效：上游超时统一由
-        http_pool.read_timeout=60.000s 控制（env GATEWAY_POOL_READ_TO）
-```
-
-该提示**只告警、不改变任何行为**（`ProviderConfig.timeout` 仍按配置保存）。
+部署在 nginx / 负载均衡之后时**必须**开启并登记代理地址，否则所有请求的 `client_ip` 都会变成代理自身地址（如 `127.0.0.1`）。开启后从右向左跳过可信代理，取第一个非可信地址作为客户端 IP（左侧条目可被客户端任意伪造，因此不会被采用）；非法地址会被忽略并回落对端地址。
 
 ### 成本口径：只统计成功请求（观察表）
 
-**预算判定与日报成本只统计成功请求。** 失败请求的上游花费可能已经产生（超时、200 但
-结构校验失败），但不进入 `usage_metrics`，因此 `query_spent_usd` / `daily_aggregates`
-会**系统性偏低**。为在不改变计费行为的前提下量化这一偏差，网关额外维护一张观察表。
-
-口径汇总：
+**预算判定与日报成本只统计成功请求。** 失败请求的上游花费可能已经产生（超时、200 但结构校验失败），但不进入 `usage_metrics`，因此 `query_spent_usd` / `daily_aggregates` 会**系统性偏低**。为在不改变计费行为的前提下量化这一偏差，网关额外维护一张观察表。
 
 | 数据源 | 统计范围 | 是否参与预算 |
 |---|---|---|
-| `usage_metrics` / `daily_aggregates` | 仅成功请求（`estimated` 行成本为 0） | ✅ 是 |
-| `unbilled_attempt_costs` | 失败但仍可能计费的尝试（估算值） | ❌ **否** |
+| `usage_metrics` / `daily_aggregates` | 仅成功请求（`estimated` 行成本为 0） | 是 |
+| `unbilled_attempt_costs` | 失败但仍可能计费的尝试（估算值） | 否 |
 
 观察表规则：
 
-- **记录**（`reason` 取值为失败的错误码）：
-
-  | `reason` | 触发场景 | 上游是否可能已计费 |
-  |---|---|---|
-  | `upstream_timeout` | 上游超时 | 是（可能已完成） |
-  | `structured_output_failed` | 上游 200 返回但结构校验失败 | 是（已计费） |
-  | `upstream_error` | 上游 5xx / 网络错误（4xx 与 429 除外） | 可能 |
-
-- **不记录**：400 / 401 / 403 / 404 / 422 / 429（上游明确拒绝，通常不计费）、缺少 Key（请求
-  未发出）、以及路由阶段就被拒的 `model_unavailable` / `budget_exhausted` / `rate_limited`
-  （未向上游发起调用）。因此**观察表为空不代表漏算为 0**，只代表没有发生「可能已计费」的失败。
-- **成本口径**：`prompt_tokens/1e6 × prompt单价`，completion 记为 0，`estimated` 恒为 1。
-  失败尝试拿不到上游 usage，因此该值是**下界估算**，不用于对账。
-- **幂等**：主键为 `billing_id:provider:model`（**不含 attempt 序号**）。客户端用同一
-  `billing_id` 重试不会重复累加，同一候选的多次重试也只记一条；但一次请求若在多个候选上
-  先后失败，会产生多行（每个候选一行）。
-- **保留期**：`storage.unbilled_retention_days`（env `GATEWAY_UNBILLED_RETENTION_DAYS`），
-  默认 30 天，`<=0` 表示不清理。启动时清理一次，之后每 6 小时一次；**只删该表**，
-  不影响 `usage_metrics` / `traces` / `error_log`。
+- `reason` 取失败的错误码。`upstream_timeout`、`structured_output_failed`、`upstream_error`（4xx 与 429 除外）会记录；400/401/403/404/422/429、缺少 Key、路由阶段即被拒的 `model_unavailable` / `budget_exhausted` / `rate_limit_exceeded` 不记录。
+- 成本口径为 `prompt_tokens/1e6 × prompt单价`，completion 记为 0，`estimated` 恒为 1；该值是**下界估算**，不用于对账。
+- 主键为 `billing_id:provider:model`（不含 attempt 序号），同候选重试只记一条；一次请求在多个候选上先后失败会产生多行。
+- 保留期见 `storage.unbilled_retention_days`（env `GATEWAY_UNBILLED_RETENTION_DAYS`），默认 30 天，`<=0` 表示不清理；启动时清理一次，之后每 6 小时一次，只删该表。
 
 表在启动时随 `executescript` 自动创建（老库无需迁移）。查询示例：
 
@@ -703,17 +755,7 @@ asyncio.run(main())
 '@ | .\.venv\Scripts\python.exe -
 ```
 
-#### 确认采集在工作
-
-**观察表为空不等于没有漏算**，先按此表判断：
-
-| 现象 | 含义 |
-|---|---|
-| `error_log` 中 `upstream_timeout` / `structured_output_failed` / `upstream_error` 有量，观察表也有 | ✅ 采集正常 |
-| 上述三种 code 有量，观察表 0 行 | ❌ 采集未生效（进程未加载新代码 / 钩子未接线） |
-| `error_log` 只有 `invalid_request` / `budget_exhausted` / `model_unavailable` 等 | ✅ 正常，请求未发出，按设计不记录 |
-
-交叉验证（列名是 `error_code`，不是 `code`）：
+**确认采集在工作**：`error_log` 中 `upstream_timeout` / `structured_output_failed` / `upstream_error` 有量时，观察表也应有数据；若为 0 行，说明采集未生效。交叉验证（列名是 `error_code`，不是 `code`）：
 
 ```sql
 SELECT error_code, COUNT(*) FROM error_log GROUP BY error_code ORDER BY 2 DESC;
@@ -736,7 +778,7 @@ curl.exe -sS -X POST http://127.0.0.1:8000/v1/chat/completions `
 
 合成数据统一用 `project_id='synthetic'` 标记，统计时排除。
 
-或直接 SQL：
+或直接 SQL（漏算率 = 漏算成本 / (已记成本 + 漏算成本)，排除合成样本与超出保留期的数据）：
 
 ```sql
 -- 漏算率 = 漏算成本 / (已记成本 + 漏算成本)；排除合成样本与超出保留期的数据
@@ -751,11 +793,7 @@ SELECT
        AND COALESCE(project_id,'') <> 'synthetic')                             AS attempts;
 ```
 
-> 统计窗口不要超过 `unbilled_retention_days`，否则老数据已被清理，比值会失真。
-
-判读建议：由于 completion 记 0 且同候选重试会合并，观察值是**下界**，实际漏算通常为
-2~4 倍。校正后漏算率 < 1% 可忽略；1%~5% 视 `budget_usd` 是否对外承诺决定；> 5% 建议
-把失败成本纳入预算（届时需先让结构化校验失败携带真实 usage，而非估算）。
+> 统计窗口不要超过 `unbilled_retention_days`，否则老数据已被清理，比值会失真。判读建议：观察值是**下界**，实际漏算通常为 2~4 倍；校正后漏算率 < 1% 可忽略，1%~5% 视 `budget_usd` 是否对外承诺决定，> 5% 建议把失败成本纳入预算（届时需先让结构化校验失败携带真实 usage，而非估算）。
 
 ## CLI 运维
 
@@ -779,12 +817,11 @@ SELECT
 .venv/Scripts/python -m cli.gateway_cli circuit
 ```
 
+CLI 还支持 `--db` 指定 SQLite 路径（默认 `data/metrics.db`）；`traces` 支持 `--limit` 与 `--status success|error|cancelled`，`daily` 支持 `--days` 与 `--provider`。
+
 ### 模板管理（CLI）
 
-模板管理也可全部走 CLI（与「调用示例 → 模板管理 HTTP 端点」操作同一 SQLite 存储，
-无需启动网关服务、无需鉴权头，适合脚本化/离线运维）。子命令
-`list / get / upsert / delete`，行为与 HTTP 端点一致：upsert 自增 version 保留历史，
-`--version` 缺省取最新或删除全部。
+模板管理也可全部走 CLI（与「调用示例 → 模板管理 HTTP 端点」操作同一 SQLite 存储，无需启动网关服务、无需鉴权头，适合脚本化/离线运维）。子命令 `list / get / upsert / delete`，行为与 HTTP 端点一致：upsert 自增 version 保留历史，`--version` 缺省取最新或删除全部。
 
 **Windows（PowerShell）：**
 
@@ -813,42 +850,76 @@ SELECT
 .venv/Scripts/python -m cli.gateway_cli templates delete tpl-greet
 ```
 
-对应 HTTP 端点见「调用示例 → 模板管理 HTTP 端点」。
+对应 HTTP 端点见「模板管理 HTTP 端点」。
+
+## 测试
+
+`tests/` 内的测试均为 **E2E（全 mock）+ 单测**：通过 `conftest.py` 启动一个模拟的 LLM 上游服务（`tests/mock_upstream.py`），并为每个用例创建指向该 mock 的网关实例。**无需真实 Provider API Key，不访问外部网络。**
+
+> 注意：请务必使用虚拟环境中的解释器（Windows 为 `.\.venv\Scripts\python.exe`，Linux/macOS 为 `.venv/bin/python`），不要用系统 `python`（系统解释器未安装 pytest，会报 `No module named pytest`）。
+
+运行全部测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -v
+```
+
+只运行某个文件 / 某个用例：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py -v
+.\.venv\Scripts\python.exe -m pytest tests/test_rate_limiter.py::test_token_bucket_capacity -v
+```
+
+带覆盖率：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -v --cov=app --cov-report=term
+```
+
+## 常见问题
+
+### 上游请求全部返回 502
+
+若所有发往 mock 上游的用例（`test_chat_completion_nonstream` 等）都报 `Upstream error 502`，通常是 **Windows 系统代理**在作祟：httpx 默认 `trust_env=True` 会把对本地 `127.0.0.1` 端口的上游请求转发给系统代理，代理返回 502。
+
+修复方式：网关上行的 HTTP 客户端禁用系统代理（`SharedHttpClientPool` 中已处理，见 `app/core/http_client_pool.py`）：
+
+```python
+httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
+```
+
+### `{"detail":"There was an error parsing the body"}`
+
+该 400 由 FastAPI 解析 body 阶段抛出，说明服务端收到的**不是合法 UTF-8 JSON**，与鉴权、schema 无关（因此不会返回 `invalid_auth` / `invalid_request`）。最常见原因：在中文 Windows 的 Git Bash / PowerShell 里用 `curl -d '...中文...'`，命令行参数被按 ANSI 代码页（GBK/CP936）传给 curl，body 变成非法 UTF-8。
+
+规避方式（任选其一）：
+
+1. body 走 stdin：`curl ... --data-binary @- <<'JSON' ... JSON`（推荐，见上方示例）；
+2. 先把 JSON 写成**无 BOM 的 UTF-8** 文件，再 `--data-binary @req.json`（PS 5.1 的 `-Encoding UTF8` 会带 BOM，推荐用 .NET `WriteAllText`）；
+3. 控制台切 UTF-8 代码页（`chcp.com 65001`），或示例内容改用 ASCII。
+
+### 401 invalid_auth
+
+请求头中的网关 Key 不在 `GATEWAY_API_KEYS` / `gateway.yaml::api_keys` 名单内。确认 Key 与运行中的配置一致；修改环境变量后需重启服务。
+
+### 流式结构化输出校验失败能自动修复吗？
+
+不能。流式 delta 已逐块发给客户端，网关只能在 `[DONE]` 前追加 `validation` 事件；需要在非流式路径使用自动修复，或在业务侧丢弃/重试。
 
 ## 设计说明：协议选型（Chat Completions vs Responses API）
 
-本项目上游统一走 **OpenAI Chat Completions 协议**（`POST /v1/chat/completions`），
-而非 OpenAI 的 **Responses API**（`POST /v1/responses`）。原因：
+本项目上游统一走 **OpenAI Chat Completions 协议**（`POST /v1/chat/completions`），而非 OpenAI 的 **Responses API**（`POST /v1/responses`）。原因：
 
-- **多供应商统一**：网关覆盖 OpenAI、DeepSeek、Kimi、Qwen、Ollama。Chat Completions
-  是事实上的兼容基线，上述供应商均实现该协议；Responses API 目前仅 OpenAI 官方支持，
-  采用它会破坏「一个适配器通吃全部供应商」的架构对称性（路由/重试/熔断/计费都要分叉）。
-- **成熟稳定**：工具调用、结构化输出（`response_format`）、SSE 流式在该协议上均有
-  完善且一致的支持，候选切换时各供应商行为对齐。
+- **多供应商统一**：网关覆盖 OpenAI、DeepSeek、Kimi、Qwen、Ollama。Chat Completions 是事实上的兼容基线，上述供应商均实现该协议；Responses API 目前仅 OpenAI 官方支持，采用它会破坏「一个适配器通吃全部供应商」的架构对称性（路由/重试/熔断/计费都要分叉）。
+- **成熟稳定**：工具调用、结构化输出（`response_format`）、SSE 流式在该协议上均有完善且一致的支持，候选切换时各供应商行为对齐。
 - **生态工具链**：主流 SDK 与第三方网关均以 Chat Completions 为兼容目标。
 
-代价是放弃了 Responses API 的服务端状态续接、内置工具（web search / file search /
-code interpreter）、推理摘要等新特性——这些能力需网关自行编排。若未来某供应商需要
-`web_search` 等内置工具，可在 openai-compat 适配器内演进，无需切换协议基线：
-
-1. **透传工具参数**：在 `_build_body()` 中新增 `tools`/`tool_choice` 字段透传，
-   把网关侧请求体中的工具声明映射到上游 Chat Completions 的 `tools` 参数；
-   `response_format` 等既有约束字段保持不变。
-2. **工具调用结果回传**：上游返回 `tool_calls` 增量时，适配器在 `StreamEvent`
-   上增加工具调用事件类型，经现有流式通道原样转发；非流式则在 `AdapterResult`
-   中携带 `tool_calls`。
-3. **能力感知路由**：注册表为供应商标记 `capabilities`，路由层在候选过滤时跳过
-   不支持目标工具的供应商，保证 fallback 链路不会回落到不支持的供应商。
-4. **本地模拟兜底**：对无上游内置工具的供应商，可在网关侧用「声明工具 → 模型生成
-   `tool_calls` → 网关执行本地搜索 → 结果注入下一轮 messages」的函数调用模式近似，
-   在业务层与内置工具对齐。
-
-如此既有供应商不受影响，新增能力只收敛在适配器与路由的少数几个点。
+代价是放弃了 Responses API 的服务端状态续接、内置工具（web search / file search / code interpreter）、推理摘要等新特性——这些能力需网关自行编排。若未来需要，可在 openai-compat 适配器内扩展：透传 `tools` / `tool_choice`、在 `StreamEvent` 中增加工具调用事件、为 Provider 标记能力并在路由层过滤，以及用「模型生成 tool_calls → 网关本地执行 → 结果注入下一轮」近似内置工具。如此新增能力只收敛在适配器与路由的少数几个点。
 
 ## 验收记录：真实双供应商模型 Fallback
 
-演示环境配置：deepseek 的 `api_base_url` 临时指向不可达地址（用于强制触发重试→fallback），
-kimi 未配置 `KIMI_API_KEY`，qwen 配置真实 Key。请求未指定 `model`，触发完整候选链。
+演示环境配置：deepseek 的 `api_base_url` 临时指向不可达地址（用于强制触发重试→fallback），kimi 未配置 `KIMI_API_KEY`，qwen 配置真实 Key。请求未指定 `model`，触发完整候选链。
 
 请求（网关鉴权 key 取 `config/gateway.yaml` 中 `api_keys` 的任一值，本地默认 `sk-gateway-dev`）：
 
@@ -889,8 +960,7 @@ JSON
 
 - **deepseek**：上游不可达，按重试策略消耗尝试后失败（`upstream_error`，已记录为 error trace）。
 - **kimi**：未配置 Key，被路由阶段按 `has_api_key()` 剔除（不产生非法请求头、不重试、不计熔断失败）。
-- **qwen**：200 OK 命中，trace 记录 `provider=qwen / model=qwen-max`，响应 id 为 24 位
-  无连字符格式（`chatcmpl-<24 hex>`）。
+- **qwen**：200 OK 命中，trace 记录 `provider=qwen / model=qwen-max`，响应 id 为 24 位无连字符格式（`chatcmpl-<24 hex>`）。
 
 ```text
 $ python -m cli.gateway_cli traces --status error
@@ -913,18 +983,18 @@ errors             16
 
 ## 目录结构
 
-```
+```text
 app/
-  api/chat.py          # /v1/chat/completions 管道
-  api/templates.py     # /v1/templates 模板管理 HTTP 端点
-  api/admin.py         # /v1/admin 指标只读查询端点（summary/traces/daily）
-  static/templates.html# /ui/templates 单文件模板管理页
-  core/                # 鉴权/限流/路由/熔断/取消/连接池/渲染/校验/配置/指标
-  adapters/            # openai-compat / anthropic 适配器 + 注册表
-  storage/             # MetricsStore（SQLite WAL + 幂等计费）
-  main.py              # FastAPI 入口 + 生命周期 + 配置热更新 + /healthz /readyz /metrics
-cli/gateway_cli.py     # 运维查询 CLI
-config/gateway.yaml    # 配置（支持热更新）
-docker/                # Dockerfile（H3 待评审）
-tests/                 # E2E（全 mock）+ 单测
+  api/chat.py           # /v1/chat/completions、/v1/models 管道
+  api/templates.py      # /v1/templates 模板管理 HTTP 端点
+  api/admin.py          # /v1/admin 指标只读查询端点（summary/traces/daily）
+  static/templates.html # /ui/templates 单文件模板管理页
+  core/                 # 鉴权/限流/路由/熔断/取消/连接池/渲染/校验/配置/指标
+  adapters/             # openai-compat / anthropic 适配器 + 注册表
+  storage/              # MetricsStore（SQLite WAL + 幂等计费）
+  main.py               # FastAPI 入口 + 生命周期 + 配置热更新 + /healthz /readyz /metrics
+cli/gateway_cli.py      # 运维查询 CLI
+config/gateway.yaml     # 配置（支持热更新）
+docker/                 # Dockerfile（H3 待评审）
+tests/                  # E2E（全 mock）+ 单测
 ```
