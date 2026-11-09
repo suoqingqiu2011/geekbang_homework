@@ -124,6 +124,25 @@ class RateLimiter:
                 continue
             items.append((name, value, await self._bucket(f"{name[0]}:{value}", float(rate))))
 
+        return await self._check_items(items)
+
+    async def check_model(self, model: str) -> tuple[bool, float, str | None]:
+        """仅检查 per-model 层（自动选路时的补检）。
+
+        请求未指定 model 时，check() 在路由前无法确定模型，model 层被跳过；
+        路由确定首选模型后调用本方法补扣。本方法只触碰 model 桶，
+        不会重复扣减 endpoint/project/user 三层。
+        """
+        rate = self._rates.get("model")
+        if not model or rate is None:
+            return True, 0.0, None
+        bucket = await self._bucket(f"m:{model}", float(rate))
+        return await self._check_items([("model", model, bucket)])
+
+    async def _check_items(
+        self, items: list[tuple[str, str, TokenBucket]]
+    ) -> tuple[bool, float, str | None]:
+        """对给定桶集合执行两阶段检查：预检不扣减，全部通过才统一扣减。"""
         # 固定顺序（model→endpoint→project→user）加锁，多桶持锁不产生死锁
         locked: list[TokenBucket] = []
         try:

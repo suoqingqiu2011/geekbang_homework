@@ -8,10 +8,22 @@ server:
   port: 8000
   workers: 4
   log_level: INFO
+  # 反向代理信任边界：默认 false，即完全不采信 X-Forwarded-For，
+  # trace 的 client_ip 一律取 TCP 对端地址（客户端无法伪造）。
+  # 部署在 nginx/网关之后时需要置为 true，并把代理地址加入 trusted_proxies，
+  # 否则所有请求的 client_ip 都会变成代理自身地址（如 127.0.0.1）。
+  trust_proxy_headers: false
+  # 可信代理地址，支持单 IP 与 CIDR。仅当直连对端命中此列表时才解析 XFF，
+  # 且从右向左取第一个非可信地址（左侧可能被客户端伪造）。
+  trusted_proxies:
+    - "127.0.0.1"
+    - "::1"
 
 storage:
   db_path: data/metrics.db
   tracing_ttl: 3600.0
+  # 观察表（unbilled_attempt_costs）保留天数；仅影响该表，<=0 表示不清理
+  unbilled_retention_days: 30
 
 rate_limit:
   # Token bucket: tokens refilled per second

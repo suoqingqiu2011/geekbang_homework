@@ -92,6 +92,9 @@ class RetryFallbackManager:
         store: MetricsStore,
         candidates,
         call_one: Callable[..., Awaitable[object]],
+        on_attempt_failure: Optional[
+            Callable[[object, GatewayError], Awaitable[None]]
+        ] = None,
     ) -> CallOutcome:
         """
         按候选链执行。
@@ -119,6 +122,18 @@ class RetryFallbackManager:
                 except Exception as exc:  # noqa: BLE001 - 统一转换为错误
                     gw_exc = exc if isinstance(exc, GatewayError) else UpstreamError(str(exc))
                     last_error = gw_exc
+                    if on_attempt_failure is not None:
+                        # 观察钩子：记录该候选失败的上游花费。
+                        # 钩子内部异常必须吞掉——观测失败绝不能打断重试/降级主流程。
+                        try:
+                            await on_attempt_failure(candidate, gw_exc)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as hook_exc:  # noqa: BLE001
+                            logger.warning(
+                                "on_attempt_failure hook failed provider=%s model=%s: %s",
+                                candidate.provider, candidate.model_name, hook_exc,
+                            )
 
                     if self.is_auth_error(gw_exc):
                         # 认证失败：不重试，映射为 502（不向客户端泄漏上游 401），跳到下一候选。

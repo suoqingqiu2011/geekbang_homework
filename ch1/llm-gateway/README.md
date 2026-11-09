@@ -352,25 +352,27 @@ http://127.0.0.1:8000/ui/templates.html   # 等价（静态挂载）
 
 ![模板管理页面示例](../docs/tpl_greet_1.png)
 
-**Windows（PowerShell）：** 先写临时文件再 `--data-binary` 发送，**不受 Git Bash 的 GBK 传参问题影响**，
-因为正文不经过命令行参数；但文件必须是 **UTF-8 且不带 BOM**：
+**Windows（PowerShell）：** body 通过 here-string 走 stdin（`--data-binary "@-"`），与下面的 Bash heredoc 一一对应。
+PS 5.1 的管道默认按 ASCII 编码，中文会变成 `?`，故先统一管道编码为 UTF-8（不带 BOM）：
 
-- PS 5.1 的 `-Encoding UTF8` 会写 BOM（首字节 `239,187,191`），`-Encoding ascii` 会破坏中文；
-- 故统一用 `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))`（PS 7+ 也可用 `-Encoding utf8NoBOM`）；
-- 自检：文件首字节应为 `123`（即 `{`）。若是 `239` 开头，说明带了 BOM，会得到
-  `400 {"detail":"There was an error parsing the body"}`。
+- `--data-binary "@-"` 的引号不能省：`@` 在 PowerShell 中是保留字符，裸写 `@-` 会报语法错误；
+- `$OutputEncoding` 只影响“字符串 → 原生程序 stdin”，不影响控制台显示；
+- 用 `New-Object System.Text.UTF8Encoding($false)` 保证不带 BOM；
+- 若忘了这一步，中文 body 会得到 `400 {"detail":"There was an error parsing the body"}`。
 
 验证通过时，渲染预览应返回 `HTTP 200` 与 `{"template_id":"tpl-greet","rendered":"你是销售助手，请回答：报价策略"}`。
 
 ```powershell
-# 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
-$json = '{"template_id":"tpl-greet","name":"greet","content":"你是{{role}}助手，请回答：{{question}}"}'
-[System.IO.File]::WriteAllText("$env:TEMP\tpl.json", $json, (New-Object System.Text.UTF8Encoding($false)))
+# 0) 统一管道编码为 UTF-8（PS 5.1 默认 ASCII，中文会变成 ?）
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
-curl.exe -X POST "http://127.0.0.1:8000/v1/templates" `
+# 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
+@'
+{"template_id":"tpl-greet","name":"greet","content":"你是{{role}}助手，请回答：{{question}}"}
+'@ | curl.exe -X POST "http://127.0.0.1:8000/v1/templates" `
   -H "Authorization: Bearer sk-gateway-dev" `
   -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\tpl.json"
+  --data-binary "@-"
 
 # 2) 列出所有模板
 curl.exe http://127.0.0.1:8000/v1/templates -H "Authorization: Bearer sk-gateway-dev"
@@ -383,22 +385,20 @@ curl.exe "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorizat
 curl.exe http://127.0.0.1:8000/v1/templates/tpl-greet/versions -H "Authorization: Bearer sk-gateway-dev"
 
 # 5) 渲染预览（不调用上游，适合调试模板）
-$json = '{"variables":{"role":"销售","question":"报价策略"}}'
-[System.IO.File]::WriteAllText("$env:TEMP\render.json", $json, (New-Object System.Text.UTF8Encoding($false)))
-
-curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
+@'
+{"variables":{"role":"销售","question":"报价策略"}}
+'@ | curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
   -H "Authorization: Bearer sk-gateway-dev" `
   -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\render.json"
+  --data-binary "@-"
 
-# 5b) 排查接口本身（纯 ASCII 可直接用 -d，不依赖文件编码）
-curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
+# 5b) 排查接口本身（纯 ASCII，不依赖管道编码）
+@'
+{"variables":{"role":"sales","question":"pricing"}}
+'@ | curl.exe -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" `
   -H "Authorization: Bearer sk-gateway-dev" `
   -H "Content-Type: application/json" `
-  -d '{\"variables\":{\"role\":\"sales\",\"question\":\"pricing\"}}'
-
-# 5c) 清理临时文件
-Remove-Item "$env:TEMP\tpl.json","$env:TEMP\render.json" -ErrorAction SilentlyContinue
+  --data-binary "@-"
 
 # 6) 删除（?version=1 删指定版本；缺省删全部）
 curl.exe -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" `
@@ -406,12 +406,13 @@ curl.exe -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" `
 curl.exe -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin。
+**Linux / macOS（Bash）：** body 通过 heredoc 走 stdin，与上面的 PowerShell here-string 一一对应；
+heredoc 直接按 UTF-8 写入 stdin，**无需**像 PowerShell 那样额外设置管道编码。
 若在 **Windows Git Bash** 中直接把中文写进 `-d '...'`，命令行参数会被按 GBK 编码传入，
 服务端收到非 UTF-8 字节 → `400 {"detail":"There was an error parsing the body"}`。
 
 ```bash
-# 创建/更新
+# 1) 创建/更新模板（返回新版本号；再次调用同一 id 会自增 version）
 curl -X POST "http://127.0.0.1:8000/v1/templates" \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
@@ -421,7 +422,17 @@ JSON
 ```
 
 ```bash
-# 渲染预览
+# 2) 列出所有模板
+curl http://127.0.0.1:8000/v1/templates -H "Authorization: Bearer sk-gateway-dev"
+
+# 3) 查询模板（缺省最新；?version=1 取历史版本）
+curl http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
+curl "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorization: Bearer sk-gateway-dev"
+
+# 4) 列出历史版本
+curl http://127.0.0.1:8000/v1/templates/tpl-greet/versions -H "Authorization: Bearer sk-gateway-dev"
+
+# 5) 渲染预览（不调用上游，适合调试模板）
 curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
   -H "Authorization: Bearer sk-gateway-dev" \
   -H "Content-Type: application/json" \
@@ -429,16 +440,26 @@ curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
 {"variables":{"role":"销售","question":"报价策略"}}
 JSON
 ```
-
 ```bash
-# 列出 / 查询 / 删除（无 body，不受编码影响）
-curl http://127.0.0.1:8000/v1/templates -H "Authorization: Bearer sk-gateway-dev"
-curl "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorization: Bearer sk-gateway-dev"
-curl -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" -H "Authorization: Bearer sk-gateway-dev"
+# 5b) 排查接口本身（纯 ASCII，不依赖命令行参数编码）
+curl -X POST "http://127.0.0.1:8000/v1/templates/tpl-greet/render" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{"variables":{"role":"sales","question":"pricing"}}
+JSON
+```
+```bash
+# 6) 删除（?version=1 删指定版本；缺省删全部）
+curl -X DELETE "http://127.0.0.1:8000/v1/templates/tpl-greet?version=1" \
+  -H "Authorization: Bearer sk-gateway-dev"
+curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-> 纯 ASCII 的 body（如 `{"variables":{"role":"sales"}}`）用 `-d '...'` 在 Git Bash 中可直接使用；
-> 含中文时统一改用 `--data-binary @- <<'JSON'` 或临时文件方式。
+> body 统一用 `--data-binary @- <<'JSON'` 走 stdin（纯 ASCII 同理），避免 `-d '...'` 的引号/转义
+> 在跨 shell 粘贴时出错。**不要把 PowerShell 命令直接粘进 Git Bash**：续行符是 `\` 而不是反引号，
+> JSON 内也不要写 `\"` 转义；反引号在 Bash 中是命令替换，会报 `-H: command not found`，
+> curl 最终因缺少 body 得到 422 `{"type":"missing","loc":["body"],"msg":"Field required"}`。
 
 聊天中引用模板：在 `POST /v1/chat/completions` 请求体中通过扩展字段
 `template_id` / `template_version`（缺省最新）/ `template_vars` 注入，渲染结果作为
@@ -566,6 +587,25 @@ curl -sS "http://localhost:8000/v1/admin/daily?days=7" -H "Authorization: Bearer
 
 超出上限的参数（如 `limit=99999`）会直接返回 `400 invalid_request`，不做静默截断。
 
+### 客户端 IP 与反向代理（X-Forwarded-For）
+
+trace 中的 `client_ip` **默认取 TCP 对端地址，不采信 `X-Forwarded-For`**，避免调用方
+伪造审计来源。相关配置在 `gateway.yaml` 的 `server` 段（或用 `GATEWAY_TRUST_PROXY_HEADERS`
+/ `GATEWAY_TRUSTED_PROXIES` 覆盖）：
+
+```yaml
+server:
+  trust_proxy_headers: false   # 默认关闭
+  trusted_proxies:             # 仅当直连对端命中此列表时才解析 XFF
+    - "127.0.0.1"
+    - "::1"
+```
+
+部署在 nginx / 负载均衡之后时**必须**开启并登记代理地址，否则所有请求的 `client_ip`
+都会变成代理自身地址（如 `127.0.0.1`）。开启后从右向左跳过可信代理，取第一个非可信
+地址作为客户端 IP（左侧条目可被客户端任意伪造，因此不会被采用）；非法地址会被忽略并
+回落对端地址。
+
 ### 计费与定价（prompt/completion 分价）
 
 供应商支持按 prompt / completion 分别定价（两者单价通常相差数倍）：
@@ -586,6 +626,136 @@ providers:
   因此日报成本可能偏低；精确账单以返回 usage 的请求为准。
 
 `daily`（CLI 与 `/v1/admin/daily`）已按 `prompt_tokens` / `completion_tokens` 分列累计。
+
+### 上游超时：只有 `http_pool.read_timeout` 生效
+
+`providers.<name>.timeout` 目前**只被解析、未接线**（`ProviderConfig.timeout` 无任何消费方），
+改它不会影响实际超时。所有上游调用共用一个连接池超时：
+
+```yaml
+http_pool:
+  connect_timeout: 5.0
+  read_timeout: 60.0     # 真正生效的上游超时
+```
+
+env 覆盖：`GATEWAY_POOL_CONNECT_TO` / `GATEWAY_POOL_READ_TO`。修改后由配置监听热重载，
+`http_pool.update_params()` 会重建客户端，**无需重启**。
+
+为避免"改了却没生效"，配置加载时若显式写了 `providers.<name>.timeout` 且与
+`http_pool.read_timeout` 不一致，会打印 warning：
+
+```
+WARNING Provider 'deepseek' 的 timeout=0.001s 不会生效：上游超时统一由
+        http_pool.read_timeout=60.000s 控制（env GATEWAY_POOL_READ_TO）
+```
+
+该提示**只告警、不改变任何行为**（`ProviderConfig.timeout` 仍按配置保存）。
+
+### 成本口径：只统计成功请求（观察表）
+
+**预算判定与日报成本只统计成功请求。** 失败请求的上游花费可能已经产生（超时、200 但
+结构校验失败），但不进入 `usage_metrics`，因此 `query_spent_usd` / `daily_aggregates`
+会**系统性偏低**。为在不改变计费行为的前提下量化这一偏差，网关额外维护一张观察表。
+
+口径汇总：
+
+| 数据源 | 统计范围 | 是否参与预算 |
+|---|---|---|
+| `usage_metrics` / `daily_aggregates` | 仅成功请求（`estimated` 行成本为 0） | ✅ 是 |
+| `unbilled_attempt_costs` | 失败但仍可能计费的尝试（估算值） | ❌ **否** |
+
+观察表规则：
+
+- **记录**（`reason` 取值为失败的错误码）：
+
+  | `reason` | 触发场景 | 上游是否可能已计费 |
+  |---|---|---|
+  | `upstream_timeout` | 上游超时 | 是（可能已完成） |
+  | `structured_output_failed` | 上游 200 返回但结构校验失败 | 是（已计费） |
+  | `upstream_error` | 上游 5xx / 网络错误（4xx 与 429 除外） | 可能 |
+
+- **不记录**：400 / 401 / 403 / 404 / 422 / 429（上游明确拒绝，通常不计费）、缺少 Key（请求
+  未发出）、以及路由阶段就被拒的 `model_unavailable` / `budget_exhausted` / `rate_limited`
+  （未向上游发起调用）。因此**观察表为空不代表漏算为 0**，只代表没有发生「可能已计费」的失败。
+- **成本口径**：`prompt_tokens/1e6 × prompt单价`，completion 记为 0，`estimated` 恒为 1。
+  失败尝试拿不到上游 usage，因此该值是**下界估算**，不用于对账。
+- **幂等**：主键为 `billing_id:provider:model`（**不含 attempt 序号**）。客户端用同一
+  `billing_id` 重试不会重复累加，同一候选的多次重试也只记一条；但一次请求若在多个候选上
+  先后失败，会产生多行（每个候选一行）。
+- **保留期**：`storage.unbilled_retention_days`（env `GATEWAY_UNBILLED_RETENTION_DAYS`），
+  默认 30 天，`<=0` 表示不清理。启动时清理一次，之后每 6 小时一次；**只删该表**，
+  不影响 `usage_metrics` / `traces` / `error_log`。
+
+表在启动时随 `executescript` 自动创建（老库无需迁移）。查询示例：
+
+```powershell
+@'
+import asyncio, json
+from app.storage.metrics_store import MetricsStore
+
+async def main():
+    s = MetricsStore("data/metrics.db")
+    await s.initialize()
+    print(json.dumps(await s.summarize_unbilled_attempt_costs(days=7), ensure_ascii=False, indent=2))
+    await s.close()
+
+asyncio.run(main())
+'@ | .\.venv\Scripts\python.exe -
+```
+
+#### 确认采集在工作
+
+**观察表为空不等于没有漏算**，先按此表判断：
+
+| 现象 | 含义 |
+|---|---|
+| `error_log` 中 `upstream_timeout` / `structured_output_failed` / `upstream_error` 有量，观察表也有 | ✅ 采集正常 |
+| 上述三种 code 有量，观察表 0 行 | ❌ 采集未生效（进程未加载新代码 / 钩子未接线） |
+| `error_log` 只有 `invalid_request` / `budget_exhausted` / `model_unavailable` 等 | ✅ 正常，请求未发出，按设计不记录 |
+
+交叉验证（列名是 `error_code`，不是 `code`）：
+
+```sql
+SELECT error_code, COUNT(*) FROM error_log GROUP BY error_code ORDER BY 2 DESC;
+```
+
+主动制造一条样本（端到端验证链路，验证完务必改回）：
+
+1. 把 `http_pool.read_timeout` 临时改为 `0.001`（热生效，无需重启）；
+2. 发请求，并用 `project` 字段打标记：
+
+```powershell
+curl.exe -sS -X POST http://127.0.0.1:8000/v1/chat/completions `
+  -H "Authorization: Bearer sk-gateway-dev" `
+  -H "Content-Type: application/json" `
+  -d '{\"model\":\"deepseek-chat\",\"project\":\"synthetic\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'
+```
+
+3. 期望响应 `upstream_timeout`，且观察表新增一行 `project_id='synthetic'`；
+4. **把 `read_timeout` 改回 `60.0`**。
+
+合成数据统一用 `project_id='synthetic'` 标记，统计时排除。
+
+或直接 SQL：
+
+```sql
+-- 漏算率 = 漏算成本 / (已记成本 + 漏算成本)；排除合成样本与超出保留期的数据
+SELECT
+  (SELECT COALESCE(SUM(cost_usd),0) FROM usage_metrics
+     WHERE created_at >= CAST(strftime('%s','now') AS INTEGER) - 14*86400)      AS billed,
+  (SELECT COALESCE(SUM(cost_usd),0) FROM unbilled_attempt_costs
+     WHERE created_at >= CAST(strftime('%s','now') AS INTEGER) - 14*86400
+       AND COALESCE(project_id,'') <> 'synthetic')                             AS unbilled,
+  (SELECT COUNT(*) FROM unbilled_attempt_costs
+     WHERE created_at >= CAST(strftime('%s','now') AS INTEGER) - 14*86400
+       AND COALESCE(project_id,'') <> 'synthetic')                             AS attempts;
+```
+
+> 统计窗口不要超过 `unbilled_retention_days`，否则老数据已被清理，比值会失真。
+
+判读建议：由于 completion 记 0 且同候选重试会合并，观察值是**下界**，实际漏算通常为
+2~4 倍。校正后漏算率 < 1% 可忽略；1%~5% 视 `budget_usd` 是否对外承诺决定；> 5% 建议
+把失败成本纳入预算（届时需先让结构化校验失败携带真实 usage，而非估算）。
 
 ## CLI 运维
 
@@ -680,16 +850,27 @@ code interpreter）、推理摘要等新特性——这些能力需网关自行�
 演示环境配置：deepseek 的 `api_base_url` 临时指向不可达地址（用于强制触发重试→fallback），
 kimi 未配置 `KIMI_API_KEY`，qwen 配置真实 Key。请求未指定 `model`，触发完整候选链。
 
-请求（网关鉴权 key 为测试 key，此处占位）：
+请求（网关鉴权 key 取 `config/gateway.yaml` 中 `api_keys` 的任一值，本地默认 `sk-gateway-dev`）：
 
-```bash
-curl.exe -s -X POST "http://127.0.0.1:8000/v1/chat/completions" `
-  -H "Authorization: Bearer <gateway-key>" `
+```powershell
+# PowerShell
+@'
+{"messages":[{"role":"user","content":"1+1=?"}],"stream":false}
+'@ | curl.exe -s -X POST "http://127.0.0.1:8000/v1/chat/completions" `
+  -H "Authorization: Bearer sk-gateway-dev" `
   -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\req.json"
+  --data-binary "@-"
 ```
 
-请求体：`{"messages":[{"role":"user","content":"1+1=?"}],"stream":false}`
+```bash
+# Git Bash
+curl -s -X POST "http://127.0.0.1:8000/v1/chat/completions" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{"messages":[{"role":"user","content":"1+1=?"}],"stream":false}
+JSON
+```
 
 响应（摘录，供应商 Key 不出现于任何输出）：
 

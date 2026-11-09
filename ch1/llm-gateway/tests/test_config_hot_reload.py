@@ -112,6 +112,65 @@ async def test_api_keys_env_override(tmp_path, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────
+# ★ providers.*.timeout 未接线：与生效的 http_pool.read_timeout 不一致时必须提示
+# ─────────────────────────────────────────────────────────────
+def _write_with_timeout(path, provider_timeout, pool_read_timeout=60.0):
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "http_pool": {"read_timeout": pool_read_timeout},
+                "providers": {
+                    "p1": {
+                        "api_base_url": "http://p1/v1",
+                        "cost_per_million_tokens": 1.0,
+                        "capacity": 5,
+                        "timeout": provider_timeout,
+                    }
+                },
+                "api_keys": ["k1"],
+                "available_models": [
+                    {"name": "m1", "provider": "p1", "routing_weight": 1.0}
+                ],
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+async def test_provider_timeout_mismatch_warns(tmp_path, caplog):
+    """providers.timeout 与 http_pool.read_timeout 不一致 → warning，且取值不被篡改。"""
+    p = tmp_path / "c.yaml"
+    _write_with_timeout(p, provider_timeout=0.001, pool_read_timeout=60.0)
+    cm = ConfigurationManager(config_path=str(p))
+    with caplog.at_level("WARNING"):
+        assert await cm.reload()
+
+    assert any(
+        "不会生效" in r.message and "p1" in r.message for r in caplog.records
+    ), caplog.text
+    # 仅提示，不改任何运行时行为
+    assert cm.config.providers["p1"].timeout == 0.001
+    assert cm.config.http_pool.read_timeout == 60.0
+
+
+async def test_provider_timeout_consistent_or_absent_does_not_warn(tmp_path, caplog):
+    """与生效值一致、或根本没配 timeout 时不应产生噪声。"""
+    p = tmp_path / "c.yaml"
+    _write_with_timeout(p, provider_timeout=60.0, pool_read_timeout=60.0)
+    cm = ConfigurationManager(config_path=str(p))
+    with caplog.at_level("WARNING"):
+        assert await cm.reload()
+    assert not any("不会生效" in r.message for r in caplog.records)
+
+    # 缺省（不写 timeout 字段）
+    _write(p)
+    with caplog.at_level("WARNING"):
+        assert await cm.reload()
+    assert not any("不会生效" in r.message for r in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────
 # ★ 缺陷B 回归：连接池参数热更新——旧客户端关闭重建，新参数生效
 # ─────────────────────────────────────────────────────────────
 async def test_http_pool_update_params_rebuilds_clients():

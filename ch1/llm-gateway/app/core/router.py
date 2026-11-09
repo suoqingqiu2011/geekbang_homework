@@ -206,38 +206,9 @@ class Router:
                         "falling back to unfiltered list", need,
                     )
 
-        # ★ 缺陷C 修复：预算核算从"最小成本(1 token)"升级为"候选最大可能成本"——
-        #   按 max_tokens（缺省 _DEFAULT_EST_TOKENS）× 单价预估，调用前就剔除
-        #   可能超支的候选，防止实际 token 用量超预算后才被发现（费用无法撤销）。
-        #   分价模式下按 prompt/completion 分别计费（典型占比 _PROMPT_RATIO_DEFAULT），
-        #   更贴近真实账单（两者单价通常差数倍）。
-        if budget_usd > 0:
-            # prompt 用量采用请求的真实估算（长 prompt 场景不再按 completion 上限
-            # 的固定占比折算而系统性低估）；completion 采用 max_tokens 上限。
-            completion_est = int(max_tokens) if max_tokens else _DEFAULT_EST_TOKENS
-            prompt_est = (
-                int(prompt_tokens_estimate)
-                if prompt_tokens_estimate > 0
-                else int(completion_est * _PROMPT_RATIO_DEFAULT)
-            )
-            kept: list[Candidate] = []
-            for c in ordered:
-                est_cost = c.estimate_cost(prompt_est, completion_est)
-                if spent_usd + est_cost <= budget_usd:
-                    kept.append(c)
-                else:
-                    logger.info(
-                        "Candidate filtered by budget: %s (est max cost $%.6f > remaining $%.6f)",
-                        c.model_name, est_cost, budget_usd - spent_usd,
-                    )
-            ordered = kept
-            if not ordered:
-                raise BudgetExhaustedError(
-                    f"Budget exhausted: spent=${spent_usd:.6f}, budget=${budget_usd:.6f}, "
-                    f"no candidate fits estimated max cost "
-                    f"(prompt_est={prompt_est}, completion_est={completion_est})"
-                )
-
+        # ★ 可用性先行：先剔除无 Key / 熔断 OPEN 的候选，再做预算过滤。
+        #   否则"候选池本来就为空"会被预算块先行拦下并报 402（budget_exhausted），
+        #   把"无可用模型"误报成"预算超支"——客户端据此会放弃重试而非稍后重试。
         available: list[Candidate] = []
         for c in ordered:
             # 无 Key 的 provider（api_key_env 已配置但环境变量缺失）为静态不可用：
@@ -261,4 +232,37 @@ class Router:
             raise ModelUnavailableError(
                 "No available model candidate (all filtered by circuit breaker or constraints)."
             )
+
+        # ★ 缺陷C 修复：预算核算从"最小成本(1 token)"升级为"候选最大可能成本"——
+        #   按 max_tokens（缺省 _DEFAULT_EST_TOKENS）× 单价预估，调用前就剔除
+        #   可能超支的候选，防止实际 token 用量超预算后才被发现（费用无法撤销）。
+        #   分价模式下按 prompt/completion 分别计费（典型占比 _PROMPT_RATIO_DEFAULT），
+        #   更贴近真实账单（两者单价通常差数倍）。
+        if budget_usd > 0:
+            # prompt 用量采用请求的真实估算（长 prompt 场景不再按 completion 上限
+            # 的固定占比折算而系统性低估）；completion 采用 max_tokens 上限。
+            completion_est = int(max_tokens) if max_tokens else _DEFAULT_EST_TOKENS
+            prompt_est = (
+                int(prompt_tokens_estimate)
+                if prompt_tokens_estimate > 0
+                else int(completion_est * _PROMPT_RATIO_DEFAULT)
+            )
+            kept: list[Candidate] = []
+            for c in available:
+                est_cost = c.estimate_cost(prompt_est, completion_est)
+                if spent_usd + est_cost <= budget_usd:
+                    kept.append(c)
+                else:
+                    logger.info(
+                        "Candidate filtered by budget: %s (est max cost $%.6f > remaining $%.6f)",
+                        c.model_name, est_cost, budget_usd - spent_usd,
+                    )
+            available = kept
+            if not available:
+                raise BudgetExhaustedError(
+                    f"Budget exhausted: spent=${spent_usd:.6f}, budget=${budget_usd:.6f}, "
+                    f"no candidate fits estimated max cost "
+                    f"(prompt_est={prompt_est}, completion_est={completion_est})"
+                )
+
         return available

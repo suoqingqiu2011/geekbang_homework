@@ -131,6 +131,43 @@ async def test_structured_output_badjson_fails(gateway):
     assert r.json()["error"]["code"] == "structured_output_failed"
 
 
+async def test_unbilled_cost_recorded_but_not_in_budget(gateway):
+    """M8 观察模式：上游已计费但本地失败时写观察表，且不影响预算累计。"""
+    trace_id = "trace-unbilled-001"
+    body = _req(
+        model="badjson",
+        trace_id=trace_id,
+        budget_usd=1.0,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "intent",
+                "schema": {
+                    "type": "object",
+                    "properties": {"intent": {"type": "string"}},
+                    "required": ["intent"],
+                },
+            },
+        },
+    )
+    r = await gateway["client"].post("/v1/chat/completions", json=body, headers=_headers())
+    assert r.status_code == 502
+
+    db = gateway["ctx"].store._require_db()  # noqa: SLF001
+    cursor = await db.execute(
+        "SELECT reason, prompt_tokens, cost_usd, estimated FROM unbilled_attempt_costs "
+        "WHERE trace_id = ?", (trace_id,)
+    )
+    row = await cursor.fetchone()
+    assert row is not None, "失败请求可能已产生上游花费，必须写入观察表"
+    assert row["reason"] == "structured_output_failed"
+    assert row["estimated"] == 1
+
+    # ★ 阶段一的关键约束：观察数据不进入预算，spent 仍为 0
+    spent = await gateway["ctx"].store.query_spent_usd(body.get("project", "default"))
+    assert spent == 0.0
+
+
 # ─────────────────────────────────────────────────────────────
 # 容错：retry / fallback / 认证失败
 # ─────────────────────────────────────────────────────────────
@@ -243,6 +280,20 @@ async def test_budget_exhausted(gateway):
     assert r.json()["error"]["code"] == "budget_exhausted"
 
 
+async def test_all_circuits_open_with_budget_returns_503(gateway):
+    """M7 回归：全熔断 + 带 budget → 503 model_unavailable，不得误报 402 预算超支。"""
+    ctx = gateway["ctx"]
+    # 打满所有 provider 的熔断（测试配置 failure_threshold=2）
+    for name in ctx.config_manager.config.providers:
+        await ctx.circuit.record_failure(ctx.store, name)
+        await ctx.circuit.record_failure(ctx.store, name)
+
+    body = _req(budget_usd=1e-9)
+    r = await gateway["client"].post("/v1/chat/completions", json=body, headers=_headers())
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "model_unavailable"
+
+
 # ─────────────────────────────────────────────────────────────
 # ★ 缺陷C 回归：调用后按实际 token 用量核算，超预算记录观测
 # ─────────────────────────────────────────────────────────────
@@ -331,3 +382,53 @@ async def test_rate_limit_429(monkeypatch, tmp_path, mock_url):
             assert body["error"]["code"] == "rate_limit_exceeded"
             assert body["error"]["type"] == "rate_limit"
             assert body["error"]["retry_after"] is not None
+
+
+async def test_auto_route_model_limit_429(monkeypatch, tmp_path, mock_url):
+    """M1 回归：model 缺省（自动选路）时 per-model 限流仍须生效。
+
+    候选数有限，连续发 M+1 次请求必然重复命中同一模型，该模型桶已耗尽
+    → 至少出现一次 429；修复前 model 层被完全跳过，永远不会 429。
+    """
+    from app.main import create_app
+
+    cfg_path = tmp_path / "gateway_rl_auto.yaml"
+    write_test_config(cfg_path, mock_url, model_limit=0.01, bucket_capacity=1.0)
+    monkeypatch.setenv("GATEWAY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("GATEWAY_DB_PATH", str(tmp_path / "rl_auto_metrics.db"))
+    monkeypatch.setenv("MOCK_KEY", "sk-test")
+    monkeypatch.setenv("GATEWAY_RATE_MODEL", "0.01")
+
+    app = create_app()
+    transport = __import__("httpx").ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with __import__("httpx").AsyncClient(
+            transport=transport, base_url="http://gateway-test", timeout=20.0
+        ) as client:
+            statuses = []
+            for _ in range(10):
+                r = await client.post(
+                    "/v1/chat/completions",
+                    json=_req(model=None),  # 自动选路
+                    headers={"Authorization": "Bearer sk-test"},
+                )
+                statuses.append(r.status_code)
+            assert statuses[0] == 200
+            assert 429 in statuses, f"model 层未生效，状态码序列={statuses}"
+
+
+async def test_spoofed_xff_not_recorded_in_trace(gateway):
+    """默认不信任 X-Forwarded-For：伪造的客户端 IP 不得写进 trace。"""
+    trace_id = "trace-xff-001"
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req(trace_id=trace_id),
+        headers={**_headers(), "X-Forwarded-For": "9.9.9.9"},
+    )
+    assert r.status_code == 200
+
+    cursor = await gateway["ctx"].store._require_db().execute(  # noqa: SLF001
+        "SELECT client_ip FROM traces WHERE trace_id = ?", (trace_id,)
+    )
+    row = await cursor.fetchone()
+    assert row["client_ip"] == "127.0.0.1"  # ASGI 对端地址，而非伪造的 9.9.9.9

@@ -117,8 +117,15 @@ class AppConfig:
     port: int = 8000
     workers: int = 4
     log_level: str = "INFO"
+    # 反向代理信任边界：仅当直连对端命中 trusted_proxies 时才采信 X-Forwarded-For，
+    # 否则一律使用 TCP 对端地址，防止客户端伪造 trace 中的 client_ip。
+    trust_proxy_headers: bool = False
+    trusted_proxies: list[str] = field(default_factory=list)
     db_path: str = "data/metrics.db"
     tracing_ttl: float = 3600.0
+    # 观察表（unbilled_attempt_costs）保留天数，用于评估失败开销的漏算规模。
+    # <= 0 表示不清理（不建议）。仅影响该观察表，不影响 usage_metrics / traces。
+    unbilled_retention_days: int = 30
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     circuit: CircuitConfig = field(default_factory=CircuitConfig)
     http_pool: HttpPoolConfig = field(default_factory=HttpPoolConfig)
@@ -217,11 +224,22 @@ class ConfigurationManager:
         cfg.port = self._env_int("PORT", _get(server, "port", cfg.port))
         cfg.workers = self._env_int("WORKERS", _get(server, "workers", cfg.workers))
         cfg.log_level = self._env_str("LOG_LEVEL", _get(server, "log_level", cfg.log_level))
+        cfg.trust_proxy_headers = self._env_bool(
+            "TRUST_PROXY_HEADERS",
+            _get(server, "trust_proxy_headers", cfg.trust_proxy_headers),
+        )
+        cfg.trusted_proxies = self._env_list(
+            "TRUSTED_PROXIES", _get(server, "trusted_proxies", cfg.trusted_proxies)
+        )
 
         # storage
         storage = raw.get("storage", {}) or {}
         cfg.db_path = self._env_str("DB_PATH", _get(storage, "db_path", cfg.db_path))
         cfg.tracing_ttl = self._env_float("TRACING_TTL", _get(storage, "tracing_ttl", cfg.tracing_ttl))
+        cfg.unbilled_retention_days = int(self._env_float(
+            "UNBILLED_RETENTION_DAYS",
+            _get(storage, "unbilled_retention_days", cfg.unbilled_retention_days),
+        ))
 
         # rate_limit
         rl = raw.get("rate_limit", {}) or {}
@@ -288,6 +306,17 @@ class ConfigurationManager:
                     name,
                     provider_cfg.cost_per_million_tokens,
                 )
+            # timeout 字段目前未接线：上游超时统一由 http_pool.read_timeout 控制。
+            # 显式配置且与生效值不一致时提示，避免"改了却没生效"。
+            explicit_timeout = _opt_float(p, "timeout")
+            if explicit_timeout is not None and abs(explicit_timeout - cfg.http_pool.read_timeout) > 1e-9:
+                logger.warning(
+                    "Provider '%s' 的 timeout=%.3fs 不会生效：上游超时统一由 "
+                    "http_pool.read_timeout=%.3fs 控制（env GATEWAY_POOL_READ_TO）",
+                    name,
+                    explicit_timeout,
+                    cfg.http_pool.read_timeout,
+                )
             cfg.providers[name] = provider_cfg
 
         # available_models
@@ -316,6 +345,21 @@ class ConfigurationManager:
             return int(os.environ.get(f"{self._env_prefix}{key}", str(default)))
         except (TypeError, ValueError):
             return int(default)
+
+    def _env_bool(self, key: str, default: Any) -> bool:
+        raw: Any = os.environ.get(f"{self._env_prefix}{key}")
+        if raw is None:
+            raw = default
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _env_list(self, key: str, default: Any) -> list[str]:
+        raw: Any = os.environ.get(f"{self._env_prefix}{key}")
+        if raw is None:
+            raw = default
+        items = raw.split(",") if isinstance(raw, str) else list(raw or [])
+        return [str(item).strip() for item in items if str(item).strip()]
 
     def _env_float(self, key: str, default: Any) -> float:
         try:

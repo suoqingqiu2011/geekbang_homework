@@ -123,6 +123,37 @@ async def test_circuit_filter(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────
+# ★ M7 回归：候选池为空时必须报"无可用模型"(503)，而非"预算超支"(402)
+# ─────────────────────────────────────────────────────────────
+async def test_all_circuits_open_with_budget_raises_model_unavailable(tmp_path):
+    """全熔断 + 带 budget → ModelUnavailableError；预算块不得先于可用性检查拦截。"""
+    from app.storage.metrics_store import MetricsStore
+
+    store = MetricsStore(str(tmp_path / "cb_budget.db"))
+    await store.initialize()
+    circuit = CircuitBreakerManager(
+        failure_threshold=2, recovery_timeout=30.0, half_open_max_calls=2
+    )
+    try:
+        for name in ("cheap", "pricey"):
+            await circuit.record_failure(store, name)
+            await circuit.record_failure(store, name)
+
+        router = Router(circuit)
+        with pytest.raises(ModelUnavailableError):
+            await router.route(store, _models(), _providers(), budget_usd=1e-10)
+    finally:
+        await store.close()
+
+
+async def test_empty_model_list_with_budget_raises_model_unavailable():
+    """模型列表为空 + 带 budget → ModelUnavailableError（而非 BudgetExhaustedError）。"""
+    router = Router(CircuitBreakerManager())
+    with pytest.raises(ModelUnavailableError):
+        await router.route(None, [], _providers(), budget_usd=1e-10)
+
+
+# ─────────────────────────────────────────────────────────────
 # ★ 无 Key provider 过滤：api_key_env 已配置但环境变量缺失 = 静态不可用
 # ─────────────────────────────────────────────────────────────
 async def _providers_with_keyless():

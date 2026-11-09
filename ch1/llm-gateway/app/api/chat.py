@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
 import uuid
+from functools import lru_cache
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Request
@@ -19,6 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..adapters.registry import get_adapter
 from ..context import AppContext
+from ..core.config_manager import AppConfig
 from ..core.retry_fallback import RetryPolicy
 from ..core.router import estimate_prompt_tokens
 from ..core.trace_freeze import TraceFreezeRecord
@@ -27,6 +30,7 @@ from ..errors import (
     RateLimitExceededError,
     StructuredOutputError,
     UpstreamError,
+    UpstreamTimeoutError,
 )
 from ..schemas import (
     ChatCompletionRequest,
@@ -43,11 +47,60 @@ logger = logging.getLogger("llm-gateway.api.chat")
 router = APIRouter(prefix="/v1", tags=["gateway"])
 
 
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+@lru_cache(maxsize=16)
+def _trusted_networks(specs: tuple[str, ...]) -> tuple[Any, ...]:
+    """把 trusted_proxies 解析成网段（缓存，避免每请求重复解析）。
+
+    支持单 IP 与 CIDR；非法条目跳过并告警，避免因一处配置错误影响全部请求。
+    """
+    nets: list[Any] = []
+    for spec in specs:
+        try:
+            nets.append(ipaddress.ip_network(spec, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid trusted_proxies entry: %s", spec)
+    return tuple(nets)
+
+
+def _is_trusted(ip: str, nets: tuple[Any, ...]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr.version == net.version and addr in net for net in nets)
+
+
+def _client_ip(request: Request, cfg: AppConfig) -> str:
+    """取客户端 IP，默认不信任 X-Forwarded-For，防止审计字段被伪造。
+
+    仅当 ``trust_proxy_headers`` 开启、且直连对端命中 ``trusted_proxies`` 时才解析 XFF；
+    解析时从右向左跳过可信代理，返回第一个不可信地址——右侧由代理追加，左侧可被客户端
+    任意伪造，所以绝不能直接取最左值。
+    """
+    peer = request.client.host if request.client else ""
+    if not cfg.trust_proxy_headers:
+        return peer or "unknown"
+
+    nets = _trusted_networks(tuple(cfg.trusted_proxies))
+    if not nets or not _is_trusted(peer, nets):
+        # 直连来源本身不可信（或未配置可信网段）→ 忽略 XFF
+        return peer or "unknown"
+
+    hops = [
+        hop.strip()
+        for hop in request.headers.get("x-forwarded-for", "").split(",")
+        if hop.strip()
+    ]
+    for hop in reversed(hops):
+        try:
+            addr = ipaddress.ip_address(hop)
+        except ValueError:
+            logger.warning("Ignoring invalid X-Forwarded-For entry: %s", hop)
+            continue
+        if not _is_trusted(hop, nets):
+            return str(addr)
+    # 所有 hop 都是可信代理（或全部非法）→ 没有可信的客户端地址，回落对端
+    return peer or "unknown"
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -127,7 +180,7 @@ async def _chat_completions_impl(
         endpoint="chat/completions",
         user_id=body.user,
         project_id=body.project,
-        client_ip=_client_ip(request),
+        client_ip=_client_ip(request, ctx.config_manager.config),
         budget_snapshot=body.budget_usd,
         has_schema=body.response_format is not None,
         schema_name=body.response_format.json_schema.name if body.response_format and body.response_format.json_schema else "",
@@ -163,6 +216,19 @@ async def _chat_completions_impl(
         max_tokens=body.max_tokens,
         prompt_tokens_estimate=estimate_prompt_tokens(messages),
     )
+
+    # ★ M1 修复：model 缺省（自动选路）时首检无法确定模型，model 层被跳过；
+    #   路由确定首选模型后补检 per-model 层（只扣 model 桶，不重复扣其他层）。
+    if not body.model:
+        allowed, retry_after, layer = await ctx.rate_limiter.check_model(
+            candidates[0].model_name
+        )
+        if not allowed:
+            ctx.metrics.inc_rate_limit_rejected()
+            raise RateLimitExceededError(
+                f"Rate limit exceeded (layer={layer}). Retry after {retry_after:.1f}s.",
+                retry_after=retry_after,
+            )
 
     # 7/8. 流式 or 非流式
     if body.stream:
@@ -245,8 +311,15 @@ async def _handle_completion(
                 )
         return result
 
+    async def on_attempt_failure(candidate, err):
+        await _record_unbilled_cost(
+            ctx, trace, err, messages, candidate.provider, candidate.model_name
+        )
+
     try:
-        outcome = await ctx.retry.execute(ctx.store, candidates, call_one)
+        outcome = await ctx.retry.execute(
+            ctx.store, candidates, call_one, on_attempt_failure=on_attempt_failure
+        )
     except GatewayError as exc:
         await _record_failure(ctx, trace, exc, messages)
         raise
@@ -465,6 +538,11 @@ async def _handle_stream(
                                 ctx, trace, candidate.provider, candidate.model_name,
                                 stream_chars, True, exc,
                             )
+                            # 观察模式：已吐字（上游已计费）后失败，记录可能产生的花费
+                            await _record_unbilled_cost(
+                                ctx, trace, exc, messages,
+                                candidate.provider, candidate.model_name,
+                            )
                             partial_recorded = True
                             await ctx.circuit.record_failure(ctx.store, candidate.provider)
                             abort_candidate = True
@@ -511,6 +589,10 @@ async def _handle_stream(
                             await _record_partial_failure_trace(
                                 ctx, trace, candidate.provider, candidate.model_name,
                                 stream_chars, True, last_error,
+                            )
+                            await _record_unbilled_cost(
+                                ctx, trace, last_error, messages,
+                                candidate.provider, candidate.model_name,
                             )
                             partial_recorded = True
                             await ctx.circuit.record_failure(ctx.store, candidate.provider)
@@ -805,3 +887,50 @@ async def _record_failure(
     trace.update_metric("status", "error").update_metric("error_code", err.code)
     await ctx.store.record_trace(trace.snapshot())
     await ctx.store.record_error(trace.trace_id, "", err.code, err.message)
+
+
+# 上游明确拒绝的状态码：通常不产生费用，记入观察表会高估漏算规模。
+# 429/400/401/403/404/422 都属于"请求未被计费处理"。
+_NOT_BILLED_STATUS = {400, 401, 403, 404, 422, 429}
+
+
+def _should_record_unbilled(err: GatewayError) -> bool:
+    """判断失败尝试是否可能已被上游计费（决定是否写入观察表）。"""
+    if getattr(err, "config_missing", False):
+        return False  # 未发出请求（缺 Key）
+    if isinstance(err, StructuredOutputError):
+        return True  # 上游已 200 返回并计费，只是本地校验失败
+    if isinstance(err, UpstreamTimeoutError):
+        return True  # 超时：上游可能已完成并计费
+    if isinstance(err, UpstreamError):
+        return getattr(err, "http_status", 502) not in _NOT_BILLED_STATUS
+    return False
+
+
+async def _record_unbilled_cost(
+    ctx: AppContext, trace: TraceFreezeRecord, err: GatewayError,
+    messages: list[dict[str, Any]], provider: str, model: str,
+) -> None:
+    """观察模式：记录失败请求可能已产生的上游花费（不改变账目与预算判定）。
+
+    失败尝试拿不到上游 usage，只能按 prompt 本地估算、completion 记 0，
+    因此该数据仅用于评估漏算规模；是否纳入预算需另行确认。
+    """
+    if not _should_record_unbilled(err):
+        return
+    try:
+        prompt_tokens = estimate_prompt_tokens(messages)
+        provider_cfg = ctx.config_manager.config.providers.get(provider)
+        cost_prompt = provider_cfg.resolve_effective_costs()[0] if provider_cfg else 0.0
+        await ctx.store.record_unbilled_attempt_cost(
+            billing_id=trace.billing_id,
+            trace_id=trace.trace_id,
+            project_id=trace.project_id,
+            provider=provider,
+            model=model,
+            reason=err.code,
+            prompt_tokens=prompt_tokens,
+            cost_usd=prompt_tokens / 1_000_000.0 * cost_prompt,
+        )
+    except Exception as exc:  # noqa: BLE001 - 观测失败不得影响错误响应
+        logger.warning("Failed to record unbilled attempt cost: %s", exc)

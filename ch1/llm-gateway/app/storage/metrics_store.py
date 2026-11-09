@@ -104,10 +104,29 @@ CREATE TABLE IF NOT EXISTS daily_aggregates (
     PRIMARY KEY (day, provider, model)
 );
 
+CREATE TABLE IF NOT EXISTS unbilled_attempt_costs (
+    attempt_key   TEXT PRIMARY KEY,               -- billing_id:provider:model:attempt，防重复累加
+    billing_id    TEXT NOT NULL,                  -- 与 usage_metrics 幂等键对齐
+    trace_id      TEXT NOT NULL,
+    project_id    TEXT,
+    provider      TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
+    reason        TEXT NOT NULL,                  -- 失败错误码（如 upstream_error）
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,     -- 本地估算（失败尝试无上游 usage）
+    cost_usd      REAL NOT NULL DEFAULT 0.0,      -- 仅按 prompt 估算，completion 记 0
+    estimated     INTEGER NOT NULL DEFAULT 1,     -- 恒为 1：该表只存估算值
+    created_at    REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_metrics (created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_metrics (provider);
+-- 预算查询（query_spent_usd 按 project_id 求和 cost_usd）覆盖索引：
+-- 避免每个带预算请求都对 usage_metrics 全表扫描。
+CREATE INDEX IF NOT EXISTS idx_usage_project_cost ON usage_metrics (project_id, cost_usd);
 CREATE INDEX IF NOT EXISTS idx_traces_created ON traces (created_at);
 CREATE INDEX IF NOT EXISTS idx_error_created ON error_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_unbilled_created ON unbilled_attempt_costs (created_at);
+CREATE INDEX IF NOT EXISTS idx_unbilled_project ON unbilled_attempt_costs (project_id, created_at);
 """
 
 
@@ -181,28 +200,35 @@ class MetricsStore:
         """
         db = self._require_db()
         total = prompt_tokens + completion_tokens
-        cursor = await db.execute(
-            """
-            INSERT OR IGNORE INTO usage_metrics (
-                billing_id, trace_id, provider, model, user_id, project_id, endpoint,
-                prompt_tokens, completion_tokens, total_tokens, complete, estimated,
-                latency_ms, ttft_ms, cost_usd, attempts, fallback_used, stream, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'chat/completions', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                billing_id, trace_id, provider, model, user_id, project_id,
-                prompt_tokens, completion_tokens, total, int(complete), int(estimated),
-                latency_ms, ttft_ms, cost_usd, attempts, int(fallback_used), int(stream),
-                time.time(),
-            ),
-        )
-        await db.commit()
-        inserted = cursor.rowcount == 1
-        if inserted:
-            await self._bump_daily_aggregate(
-                provider, model, prompt_tokens, completion_tokens, total,
-                latency_ms, cost_usd,
+        # 明细与日报必须同事务提交：任一语句失败整体回滚，避免"明细已记账、
+        # 日报未累计"的永久不一致（崩溃/异常时不再留下半条账）。
+        try:
+            cursor = await db.execute(
+                """
+                INSERT OR IGNORE INTO usage_metrics (
+                    billing_id, trace_id, provider, model, user_id, project_id, endpoint,
+                    prompt_tokens, completion_tokens, total_tokens, complete, estimated,
+                    latency_ms, ttft_ms, cost_usd, attempts, fallback_used, stream, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'chat/completions', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    billing_id, trace_id, provider, model, user_id, project_id,
+                    prompt_tokens, completion_tokens, total, int(complete), int(estimated),
+                    latency_ms, ttft_ms, cost_usd, attempts, int(fallback_used), int(stream),
+                    time.time(),
+                ),
             )
+            inserted = cursor.rowcount == 1
+            if inserted:
+                # 内部不再 commit，由本函数统一提交
+                await self._bump_daily_aggregate(
+                    provider, model, prompt_tokens, completion_tokens, total,
+                    latency_ms, cost_usd,
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         return inserted
 
     async def _bump_daily_aggregate(
@@ -210,6 +236,7 @@ class MetricsStore:
         prompt_tokens: int, completion_tokens: int, total_tokens: int,
         latency_ms: float, cost_usd: float,
     ) -> None:
+        """累加日报。仅由 record_usage 在同一事务内调用，本函数不再 commit。"""
         db = self._require_db()
         day = time.strftime("%Y-%m-%d")
         await db.execute(
@@ -232,7 +259,6 @@ class MetricsStore:
                 cost_usd, latency_ms,
             ),
         )
-        await db.commit()
 
     # ── 预算：按实际 token 用量核算累计花费 ────────────────────
     async def query_spent_usd(self, project_id: str) -> float:
@@ -248,6 +274,80 @@ class MetricsStore:
         )
         row = await cursor.fetchone()
         return float(row["spent"])
+
+    # ── 观察模式：失败请求可能已产生的上游花费 ─────────────────
+    async def record_unbilled_attempt_cost(
+        self,
+        *,
+        billing_id: str,
+        trace_id: str,
+        project_id: str,
+        provider: str,
+        model: str,
+        reason: str,
+        prompt_tokens: int,
+        cost_usd: float,
+    ) -> bool:
+        """记录失败请求的上游花费，**仅供观察，不参与预算累计**。
+
+        失败尝试拿不到上游 usage，prompt_tokens 为本地估算、completion 记 0，
+        因此该值用于评估「漏算规模」（量级判断），不作为对账依据。
+        attempt_key 幂等：同一请求重复失败（客户端重试）不会重复累加。
+        """
+        db = self._require_db()
+        key = f"{billing_id}:{provider}:{model}"
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO unbilled_attempt_costs "
+            "(attempt_key, billing_id, trace_id, project_id, provider, model, "
+            " reason, prompt_tokens, cost_usd, estimated, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (
+                key, billing_id, trace_id, project_id, provider, model,
+                reason, prompt_tokens, cost_usd, time.time(),
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+    async def purge_unbilled_attempt_costs(self, retention_days: int) -> int:
+        """删除超过保留期的观察数据（仅 unbilled_attempt_costs，不影响账目表）。
+
+        retention_days <= 0 时不做任何事并返回 0。
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = time.time() - retention_days * 86400.0
+        db = self._require_db()
+        cursor = await db.execute(
+            "DELETE FROM unbilled_attempt_costs WHERE created_at < ?", (cutoff,)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+    async def summarize_unbilled_attempt_costs(self, days: int = 7) -> dict[str, Any]:
+        """按天窗口汇总观察数据：总量 + 按 reason 分组（用于评估漏算规模）。"""
+        db = self._require_db()
+        since = time.time() - max(days, 1) * 86400.0
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(cost_usd), 0.0) AS cost_usd "
+            "FROM unbilled_attempt_costs WHERE created_at >= ?",
+            (since,),
+        )
+        total = await cursor.fetchone()
+        cursor = await db.execute(
+            "SELECT reason, COUNT(*) AS count, COALESCE(SUM(cost_usd), 0.0) AS cost_usd "
+            "FROM unbilled_attempt_costs WHERE created_at >= ? "
+            "GROUP BY reason ORDER BY cost_usd DESC",
+            (since,),
+        )
+        by_reason = [dict(row) for row in await cursor.fetchall()]
+        return {
+            "days": days,
+            "count": int(total["count"]),
+            "cost_usd": float(total["cost_usd"]),
+            "by_reason": by_reason,
+            "note": "观察数据：prompt 估算、completion 记 0，不参与预算累计",
+        }
 
     # ── Trace ─────────────────────────────────────────────────
     async def record_trace(self, trace: dict[str, Any]) -> None:

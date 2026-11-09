@@ -139,6 +139,32 @@ async def _config_watcher(ctx: AppContext, stop_event: asyncio.Event) -> None:
         logger.exception("Config watcher stopped unexpectedly")
 
 
+_UNBILLED_SWEEP_INTERVAL = 6 * 3600  # 每 6 小时清理一次观察表
+
+
+async def _unbilled_cleanup_loop(ctx: AppContext, stop_event: asyncio.Event) -> None:
+    """定期清理观察表；保留期见 storage.unbilled_retention_days。
+
+    只删 unbilled_attempt_costs，不触碰 usage_metrics / traces / error_log。
+    任何异常都只记 warning，不影响服务运行。
+    """
+    while not stop_event.is_set():
+        try:
+            removed = await ctx.store.purge_unbilled_attempt_costs(
+                ctx.config_manager.config.unbilled_retention_days
+            )
+            if removed:
+                logger.info("Purged %d unbilled attempt cost rows", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 清理失败不影响服务
+            logger.warning("Unbilled cleanup failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=_UNBILLED_SWEEP_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv()  # 环境变量优先级：进程 env > .env > YAML
@@ -164,6 +190,7 @@ async def lifespan(app: FastAPI):
 
     stop_event = asyncio.Event()
     watcher = asyncio.create_task(_config_watcher(ctx, stop_event), name="config-watcher")
+    cleaner = asyncio.create_task(_unbilled_cleanup_loop(ctx, stop_event), name="unbilled-cleanup")
     logger.info("LLM Gateway started (config v%d, %d providers)",
                 cfg_mgr.version, len(cfg_mgr.config.providers))
 
@@ -172,6 +199,7 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         watcher.cancel()
+        cleaner.cancel()
         await ctx.http_pool.close()
         await ctx.store.close()
         logger.info("LLM Gateway shutdown complete")

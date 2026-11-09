@@ -147,3 +147,36 @@ async def test_concurrent_check_serialized_no_over_consume():
     )
     allowed = sum(1 for r in results if r[0])
     assert allowed == 1
+
+
+# ─────────────────────────────────────────────────────────────
+# ★ M1 回归：自动选路（model=None）时 per-model 层必须生效，
+#   且补检只能扣 model 桶，不得重复扣 endpoint/project/user
+# ─────────────────────────────────────────────────────────────
+async def test_check_model_only_consumes_model_layer():
+    """check_model 只创建并扣减 model 桶；超限时 layer 报 model。"""
+    rl = RateLimiter(
+        rates={"model": 1.0, "endpoint": 1.0, "project": 1.0, "user": 1.0},
+        bucket_capacity=1.0,
+    )
+    ok, retry, layer = await rl.check_model("m1")
+    assert ok is True
+    assert retry == 0.0
+    assert layer is None
+    assert set(rl._buckets) == {"m:m1"}  # 未创建其他层的桶
+
+    ok, retry, layer = await rl.check_model("m1")
+    assert ok is False
+    assert layer == "model"
+    assert retry > 0
+
+
+async def test_check_model_noop_when_disabled_or_empty():
+    """model 层未配置或模型名为空时直接放行，且不创建桶。"""
+    rl = RateLimiter(rates={"endpoint": 1.0}, bucket_capacity=1.0)
+    assert await rl.check_model("m1") == (True, 0.0, None)
+    assert rl._buckets == {}
+
+    rl2 = RateLimiter(rates={"model": 1.0}, bucket_capacity=1.0)
+    assert await rl2.check_model("") == (True, 0.0, None)
+    assert rl2._buckets == {}

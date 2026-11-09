@@ -94,6 +94,33 @@ async def test_execute_stream_backoff_matches_retry_policy(gateway, monkeypatch)
     assert slept == [policy.backoff_for(1), policy.backoff_for(2)]
 
 
+async def test_attempt_failure_hook_error_does_not_break_retry(gateway):
+    """观察钩子抛异常必须被吞掉：重试/降级照常推进，对外仍是原始上游错误。"""
+    policy = RetryPolicy(max_attempts=1, base_backoff=0.01, max_backoff=0.1, jitter=0.0)
+    mgr = RetryFallbackManager(gateway["ctx"].circuit, policy)
+
+    class _Cand:
+        provider = "ok"
+        model_name = "m"
+
+    seen = {"call": 0, "hook": 0}
+
+    async def call_one(candidate, probe=False, attempt=1) -> object:  # noqa: ARG001,RUF100
+        seen["call"] += 1
+        raise UpstreamError("boom", http_status=502)
+
+    async def broken_hook(candidate, err) -> None:  # noqa: ARG001,RUF100
+        seen["hook"] += 1
+        raise RuntimeError("hook exploded")
+
+    with pytest.raises(UpstreamError):
+        await mgr.execute(
+            gateway["ctx"].store, [_Cand()], call_one, on_attempt_failure=broken_hook
+        )
+
+    assert seen == {"call": 1, "hook": 1}  # 钩子被调用但异常未向上传播
+
+
 # ─────────────────────────────────────────────────────────────
 # 配置缺失（无 Key）的 auth 错误：不重试、不计熔断失败
 # ─────────────────────────────────────────────────────────────
