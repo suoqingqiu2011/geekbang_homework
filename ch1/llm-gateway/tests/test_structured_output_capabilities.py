@@ -300,3 +300,64 @@ async def test_stream_plain_chat_no_validation_event(gateway):
     events = _parse_sse(r.text)
     assert events[-1] == {"type": "[DONE]"}
     assert all(e.get("type") != "validation" for e in events)
+
+
+# ─────────────────────────────────────────────────────────────
+# 缓冲模式：stream + response_format + buffer_until_valid
+# ─────────────────────────────────────────────────────────────
+async def test_stream_buffer_until_valid_delivers_only_validated_json(gateway):
+    """校验通过后才下发：内容为合法 JSON，且上游走非流式调用。"""
+    take_openai_requests()  # 清空历史捕获
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req("jsonstream", stream=True, response_format=RF, buffer_until_valid=True),
+        headers=_headers(),
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert events[-1] == {"type": "[DONE]"}
+
+    chunks = [
+        e for e in events
+        if e.get("object") == "chat.completion.chunk" and e.get("type") is None
+    ]
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks
+    )
+    assert json.loads(content) == {"intent": "greeting", "items": ["a", "b"]}
+
+    validation = [e for e in events if e.get("type") == "validation"]
+    assert len(validation) == 1
+    assert validation[0]["status"] == "ok"
+    assert validation[0]["error"] is None
+
+    # 缓冲模式在内部使用非流式上游调用，避免边收边发
+    reqs = take_openai_requests()
+    assert reqs and reqs[-1]["stream"] is False
+
+
+async def test_stream_buffer_until_valid_returns_error_on_invalid_json(gateway):
+    """校验失败：不向客户端下发任何内容，仅返回错误事件。"""
+    r = await gateway["client"].post(
+        "/v1/chat/completions",
+        json=_req("badjson", stream=True, response_format=RF, buffer_until_valid=True),
+        headers=_headers(),
+    )
+    assert r.status_code == 200
+    events = _parse_sse(r.text)
+    assert len(events) == 1
+    assert events[0]["error"]["code"] == "structured_output_failed"
+    assert all(e.get("object") != "chat.completion.chunk" for e in events)
+
+
+async def test_buffer_until_valid_requires_stream_and_response_format(gateway):
+    """buffer_until_valid 仅在 stream + response_format 组合下有意义，其他组合直接拒绝。"""
+    for body in (
+        _req("ok", response_format=RF, buffer_until_valid=True),  # 缺 stream
+        _req("ok", stream=True, buffer_until_valid=True),         # 缺 response_format
+    ):
+        r = await gateway["client"].post(
+            "/v1/chat/completions", json=body, headers=_headers()
+        )
+        assert r.status_code == 400
+        assert r.json()["error"]["code"] == "invalid_request"

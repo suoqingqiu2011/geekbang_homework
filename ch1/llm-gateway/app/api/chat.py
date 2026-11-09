@@ -232,6 +232,9 @@ async def _chat_completions_impl(
 
     # 7/8. 流式 or 非流式
     if body.stream:
+        # 可选缓冲模式：先完成校验/修复，再一次性以 SSE 下发；默认行为保持不变。
+        if body.buffer_until_valid:
+            return await _handle_buffered_stream(ctx, body, trace, messages, candidates)
         return await _handle_stream(ctx, request, body, trace, messages, candidates)
     return await _handle_completion(ctx, body, trace, messages, candidates)
 
@@ -242,6 +245,9 @@ async def _chat_completions_impl(
 async def _handle_completion(
     ctx: AppContext, body: ChatCompletionRequest, trace: TraceFreezeRecord,
     messages: list[dict[str, Any]], candidates,
+    *,
+    normalize_content: bool = False,
+    stream_delivery: bool = False,
 ):
     schema = _resolve_schema(body)
     cfg = ctx.config_manager.config
@@ -309,6 +315,10 @@ async def _handle_completion(
                 raise StructuredOutputError(
                     f"Output failed validation for {candidate.provider}: {err}"
                 )
+            # 缓冲模式：下发前统一序列化校验后的数据，确保客户端拿到的一定是合法 JSON
+            # （含 validator 通过平衡块提取修复的情况）。
+            if normalize_content:
+                result.content = json.dumps(_data, ensure_ascii=False, separators=(",", ":"))
         return result
 
     async def on_attempt_failure(candidate, err):
@@ -356,7 +366,7 @@ async def _handle_completion(
         cost_usd=cost_usd,
         attempts=outcome.attempts,
         fallback_used=outcome.provider != candidates[0].provider,
-        stream=False,
+        stream=stream_delivery,
         complete=result.usage.complete,
         estimated=result.usage.estimated,
         user_id=body.user,
@@ -388,6 +398,80 @@ async def _handle_completion(
             complete=result.usage.complete,
             estimated=result.usage.estimated,
         ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# 缓冲式流式管道（stream + response_format + buffer_until_valid）
+# ─────────────────────────────────────────────────────────────
+async def _handle_buffered_stream(
+    ctx: AppContext, body: ChatCompletionRequest, trace: TraceFreezeRecord,
+    messages: list[dict[str, Any]], candidates,
+) -> StreamingResponse:
+    """先完成校验/修复/计费，再把已验证结果以 SSE 一次性下发。
+
+    适用于“宁可不流式，也不能先收到无效内容”的结构化输出场景。
+    """
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    try:
+        result = await _handle_completion(
+            ctx, body, trace, messages, candidates,
+            normalize_content=True,
+            stream_delivery=True,
+        )
+    except GatewayError as exc:
+        # except 作用域结束后 exc 会被删除，先绑定到局部变量再供生成器闭包使用
+        error = exc
+
+        async def _error_events() -> AsyncIterator[str]:
+            yield _error_event(error)
+
+        return StreamingResponse(
+            _error_events(), media_type="text/event-stream", headers=headers
+        )
+
+    content = str(result.choices[0].message.get("content") or "")
+    finish_reason = result.choices[0].finish_reason
+    base: dict[str, Any] = {
+        "id": result.id,
+        "object": "chat.completion.chunk",
+        "created": result.created,
+        "model": result.model,
+    }
+
+    async def _events() -> AsyncIterator[str]:
+        yield _sse({
+            **base,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": None,
+            }],
+        })
+        yield _sse({
+            **base,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+        })
+        # 内容在发送前已通过校验，故 status 恒为 ok
+        yield _sse({
+            **base,
+            "type": "validation",
+            "status": "ok",
+            "error": None,
+            "choices": [],
+        })
+        yield _sse_done()
+
+    return StreamingResponse(
+        _events(), media_type="text/event-stream", headers=headers
     )
 
 

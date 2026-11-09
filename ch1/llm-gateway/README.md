@@ -79,6 +79,8 @@ curl http://127.0.0.1:8000/metrics
 curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 ```
 
+> 首次调用对话接口前注意：`model` 可省略，但省略时网关会按成本/思考能力评分自动选路，实际命中的供应商/模型可能出乎意料（响应体 `model` 会回显）。需要固定时显式传 `model`（如 `"deepseek-chat"`），可选值见 `GET /v1/models` 或 `config/gateway.yaml` 的 `available_models`。
+
 ### 鉴权与 Provider Key
 
 网关准入使用统一 Bearer Key，来源优先级为 **环境变量 > `gateway.yaml`**：
@@ -208,6 +210,7 @@ providers:
 | `model` | string，可选 | 省略时自动选路；显式指定则只走该模型 |
 | `messages` | array | 必填，1~64 条；`role` 支持 system/user/assistant/tool |
 | `stream` | bool | 是否 SSE 流式 |
+| `buffer_until_valid` | bool | 仅 `stream` + `response_format` 有效；缓冲完整输出并校验通过后再一次性下发 |
 | `temperature` | float，0~2 | 采样温度 |
 | `max_tokens` | int，1~32768 | 最大生成 token 数 |
 | `response_format` | object | `json_object` 或 `json_schema` |
@@ -439,7 +442,9 @@ data: [DONE]
 
 > 普通对话流（未携带 `response_format`）**不会**发送 `validation` 事件，事件序列与 OpenAI 官方一致。
 
-**语义与取舍：** 流式下 delta 已逐块透传给客户端，因此校验只能**事后进行、无法自动修复**；`status:"error"` 表示整段拼接内容不合 schema，调用方应丢弃本次结果或按业务重试。非流式路径则在返回前校验并尝试自动修复，失败会重试/fallback——两者行为不同，需分别处理。
+**语义与取舍：** 默认（`buffer_until_valid: false`）下 delta 已逐块透传给客户端，因此校验只能**事后进行、无法自动修复**；`status:"error"` 表示整段拼接内容不合 schema，调用方应丢弃本次结果或按业务重试。非流式路径则在返回前校验并尝试自动修复，失败会重试/fallback——两者行为不同，需分别处理。
+
+若业务要求“先校验通过再下发”，可设置 `buffer_until_valid: true`（见下节）：网关会先缓冲完整输出并完成校验/修复，校验通过后才发送 SSE，校验失败时**不会先吐字再报错**。代价是首字节延迟等于完整生成时间。
 
 **示例（Bash / Git Bash）：** body 通过 heredoc 走 stdin（`--data-binary @-`），避免 Windows 控制台把参数中的中文转成 GBK 导致服务端 JSON 解析失败。
 
@@ -455,6 +460,36 @@ curl -sS -N http://localhost:8000/v1/chat/completions \
    "schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}
 JSON
 ```
+
+#### 缓冲模式（`buffer_until_valid: true`）
+
+请求体需同时满足 `stream:true`、`response_format` 与 `buffer_until_valid:true`，否则返回 `400 invalid_request`。工作方式：
+
+1. 网关改用**非流式上游调用**，完成路由、重试/fallback、schema 校验与自动修复；
+2. 校验通过后才发送 SSE：一个完整内容 chunk（`delta.content` 为已校验 JSON）→ finish chunk → `validation status:"ok"` → `[DONE]`；
+3. 校验失败时不发送任何内容，只返回一条错误事件（如 `structured_output_failed`），不会先吐字再报错。
+
+> 该模式沿用流式响应约定：HTTP 状态仍为 `200`，失败信息在 SSE 的 `data: {"error":{...}}` 中，调用方应以 `error.code` 判定失败。
+
+因此该模式**不再逐 token 下发**，首字节延迟等于完整生成 + 校验时间；自动修复过的输出会以重新序列化后的 JSON 下发。需要逐 token 进度时保持默认模式。
+
+```bash
+curl -sS -N -X POST "http://127.0.0.1:8000/v1/chat/completions" \
+  -H "Authorization: Bearer sk-gateway-dev" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{"model":"deepseek-chat",
+ "messages":[{"role":"user","content":"解析用户意图，返回 JSON"}],
+ "stream":true,
+ "buffer_until_valid":true,
+ "response_format":{"type":"json_schema","json_schema":{"name":"intent",
+   "schema":{"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}}}}
+JSON
+```
+
+> **与既有 validation 契约的关系：** 上面的“chunks → validation → `[DONE]`”描述的是默认模式；缓冲模式是其可选扩展：成功时仍在 `[DONE]` 前输出 `validation(status:"ok")`，失败时不输出内容、只输出 error 事件，因此不会出现 `status:"error"`。两种模式下，若所有候选均失败、未产生可用输出，都只返回 error 事件（默认模式同样如此），并非契约冲突。
+>
+> 另注意：validation 判定的是拼接后经 validator 处理（含平衡块提取修复）的结果；默认模式不回写修复内容，所以 `status:"ok"` 不代表客户端已收到的原始 chunk 本身就是纯 JSON。缓冲模式下发的是重新序列化后的合法 JSON，不存在该歧义。
 
 ### 模板管理 HTTP 端点（`/v1/templates`）
 
@@ -631,6 +666,7 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 
 - 按 Provider 能力降级 `response_format`：`json_schema` 原样透传；`json_object` 追加 JSON 提示词并注入完整 schema；`none` 由适配器用提示约束兜底。
 - 本地 validator 是唯一校验权威：先严格解析，失败后尝试提取平衡的 `{...}` / `[...]` 块自动修复；仍失败则重试 / fallback。
+- 流式默认事后校验；请求设置 `buffer_until_valid: true` 时，改用非流式上游调用，校验/修复通过后才一次性下发 SSE。
 - 上游对 `response_format` 返回 400 时，去掉该参数并补充 JSON 提示词重试一次。
 - schema 校验器按 LRU 缓存（上限 256），防止恶意唯一 schema 撑爆内存。
 - 消息中命中角色伪装、指令覆盖等启发式规则时返回 `400 prompt_injection_detected`；该机制是启发式防护，不是绝对安全边界。

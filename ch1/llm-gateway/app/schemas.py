@@ -33,6 +33,9 @@ class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None          # None → 路由器自动选择
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
+    # 仅对 stream + response_format 生效：先缓冲完整输出并完成校验/修复，
+    # 校验通过后再一次性下发，避免客户端先收到不可用内容。
+    buffer_until_valid: bool = False
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     response_format: Optional[ResponseFormat] = None
@@ -65,6 +68,10 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("template_id required when template_version is set")
         if self.top_logprobs is not None and not self.logprobs:
             raise ValueError("logprobs must be true when top_logprobs is set")
+        if self.buffer_until_valid and not self.stream:
+            raise ValueError("buffer_until_valid requires stream=true")
+        if self.buffer_until_valid and self.response_format is None:
+            raise ValueError("buffer_until_valid requires response_format")
         return self
 
     @field_validator("stop")
