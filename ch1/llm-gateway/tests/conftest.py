@@ -26,6 +26,9 @@ from .mock_upstream import build_mock_app  # noqa: E402
 # 而 config_manager.get_api_keys() 优先读取环境变量 GATEWAY_API_KEYS。
 # 故此处须显式设置（而非 pop），使 load_dotenv(override=False) 不会用 .env 覆盖。
 os.environ["GATEWAY_API_KEYS"] = "sk-test"
+# 测试刻意使用弱 Key，固定为 dev profile，避免 developer 的 .env 设置了
+# GATEWAY_ENV=production 时启动自检直接拒绝（生产环境会拒绝弱口令）。
+os.environ["GATEWAY_ENV"] = "dev"
 
 
 # ─────────────────────────────────────────────────────────────

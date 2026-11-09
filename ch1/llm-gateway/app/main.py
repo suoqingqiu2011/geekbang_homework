@@ -27,7 +27,7 @@ from .api.admin import router as admin_router
 from .api.chat import router as chat_router
 from .api.templates import router as templates_router
 from .context import AppContext
-from .core.auth import AuthCheck
+from .core.auth import AuthCheck, find_weak_keys
 from .core.cancellation import CancellationHandler
 from .core.circuit_breaker import CircuitBreakerManager
 from .core.config_manager import ConfigurationManager
@@ -165,6 +165,29 @@ async def _unbilled_cleanup_loop(ctx: AppContext, stop_event: asyncio.Event) -> 
             continue
 
 
+def _check_gateway_key_strength(keys: list[str]) -> None:
+    """启动自检：生产环境拒绝弱口令/过短的网关 Key（SPEC §8.1）。
+
+    - 空 Key 列表由 AuthCheck 的 fail-closed 语义兜底（拒绝所有请求）；
+    - dev 环境仅告警，避免打断本地调试；
+    - 日志只记录弱 Key 数量，不输出 Key 本身。
+    """
+    weak = find_weak_keys(keys)
+    if not weak:
+        return
+    message = (
+        f"Detected {len(weak)} weak gateway API key(s) (shorter than 32 chars "
+        f"or a default value). Generate one with: "
+        f"python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+    )
+    profile = os.environ.get("GATEWAY_ENV", "dev").strip().lower()
+    if profile in {"prod", "production"}:
+        raise RuntimeError(
+            f"Refusing to start with GATEWAY_ENV={profile}: {message}"
+        )
+    logger.warning("%s (dev profile: allowed)", message)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv()  # 环境变量优先级：进程 env > .env > YAML
@@ -177,6 +200,9 @@ async def lifespan(app: FastAPI):
     await cfg_mgr.reload()
     if not cfg_mgr.config.loaded:
         raise RuntimeError("Gateway config failed to load — check config/gateway.yaml")
+
+    # 在初始化存储/连接池之前完成校验，避免带着弱口令启动并占用资源
+    _check_gateway_key_strength(cfg_mgr.get_api_keys())
 
     ctx = _build_context(cfg_mgr)
     await ctx.store.initialize()

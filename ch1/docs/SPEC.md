@@ -3,9 +3,10 @@
 | 项目 | 内容 |
 | --- | --- |
 | 文档名称 | LLM Gateway 规格计划书 |
-| 版本 | v1.0 |
+| 版本 | v1.3 |
 | 状态 | 待评审（Draft / Ready for Review） |
 | 日期 | 2026-09-11 |
+| 修订日期 | 2026-11-09（补充安全实现细节，见文末变更记录） |
 | 适用范围 | 自建 LLM 网关（Self-hosted LLM Gateway） |
 | 目标读者 | 技术团队、架构评审、实施工程师 |
 
@@ -132,11 +133,14 @@ Client / Agent SDK（≥10 个下游客户端）
 - **密钥来源**：配置中心 / 环境变量 / 密钥库，支持**动态配置与轮换**（H4：当前仅提供 Kimi、DeepSeek 两个测试密钥，其余预留动态下发通道）。
 - **行为**：未携带 / 非法 / 过期 Key 返回 `401`；无权限访问特定模型返回 `403`。
 - **性能**：密钥校验命中缓存（TTL 缓存），避免每次请求访问数据库。
+- **密钥比较**：请求 Key 与配置 Key 统一按 UTF-8 字节做常量时间比较（`hmac.compare_digest`）。携带非 ASCII 或其他非法字节序列的 Key 一律按"不匹配"处理并返回 `401`，不会因比较器类型错误降级为 `500`。
+- **主体绑定（硬配额）**：`api_keys` 支持两种写法——纯字符串（向后兼容，不绑主体）或 `{key, user, project, budget_usd}` 对象。对象写法下，网关以服务端 `user/project` 覆盖请求体同名字段；`budget_usd > 0` 作为该 Key 的**硬性单请求预算上限**，客户端请求值只能收紧（取两者中更严者），填 `0` 不能再表示"不限制"。环境变量注入的 Key 不携带绑定信息。
 
 ### 4.2 RateLimiter（限流）
 
 - **算法**：Token Bucket（令牌桶）。
 - **粒度优先级（降序）**：`per-model` > `per-endpoint` > `per-project` > `per-user`。
+- **限流主体**：`project` / `user` 优先取认证后的**服务端绑定主体**，未绑定 Key 才回退到请求体字段；绑定后无法通过轮换请求体中的 project/user 重置限流桶。
 - **当前范围**：token 配额与突发量暂不考虑。
 - **行为**：超限返回 `429`，携带 `Retry-After` 头。
 
@@ -154,6 +158,7 @@ Client / Agent SDK（≥10 个下游客户端）
 
 - **引擎**：Jinja2 模板 + SQLite 模板存储。
 - **能力**：模板版本管理、变量填充、缺失变量检测（缺失时返回结构化错误，不调用上游）。
+- **安全**：模板内容属不可信输入（可经模板管理接口写入），渲染固定使用 Jinja2 沙箱环境（`ImmutableSandboxedEnvironment`），禁止访问下划线属性与危险内置对象，模板不具备代码执行能力；命中沙箱拦截时返回 `400 invalid_request`，不执行、不透传。
 - **固化**：提示词、输出约束（Schema）、额度预算（Budget）、链路追踪信息在同一请求中一并固化。
 
 ### 4.6 Router（模型路由）
@@ -188,6 +193,7 @@ Client / Agent SDK（≥10 个下游客户端）
 
 - 按 JSON Schema 校验上游输出。
 - 无效 JSON 进入**自动修复**流程（截取/补全/重试解析），仍失败则触发重试或返回结构化错误。
+- **Schema 安全**：客户端提供的 JSON Schema 仅允许本地 `#/...` 指针式 `$ref`；校验器以**空引用注册表**（empty `Registry`）实例化，外部 `$ref` 不会发起任何网络请求。管道在调用上游之前即扫描 Schema，发现非本地 `$ref` 直接返回 `400 invalid_request`，避免先付费调用上游；若校验期仍遇到不可解析引用，按校验失败（`unresolvable_ref`）处理而非抛出网关内部错误。
 
 ### 4.11 Usage / Metrics Store（用量与指标存储）
 
@@ -239,6 +245,8 @@ Client / Agent SDK（≥10 个下游客户端）
 
 - `response_format` 缺省时无强约束；提供时按 JSON Schema 校验/修复。
 - 网关扩展字段：`budget_usd`（额度预算）、`trace_id`（可选，缺省自动生成）。
+- `budget_usd` 语义：`0` 表示"客户端不额外设限"；若所属 API Key 配置了硬配额，实际生效预算 = `min(Key 硬配额, budget_usd)`（忽略其中的 0）。绑定 Key 的 `user` / `project` 以服务端配置为准，请求体同名字段被覆盖。
+- 入参边界：单条消息 ≤ 100,000 字符、消息合计 ≤ 512,000 字符、消息条数 ≤ 64、单条 `stop` ≤ 256 字符且最多 4 条；`template_vars` 序列化后 ≤ 64KB 且节点数 ≤ 500、深度 ≤ 10；JSON Schema 节点数 ≤ 1,000、深度 ≤ 20。超限统一返回 `400 invalid_request`。
 
 ### 5.3 响应体（非流式）
 
@@ -351,14 +359,19 @@ Client / Agent SDK（≥10 个下游客户端）
 ### 8.1 认证与授权
 - API Key 认证（Bearer），密钥动态配置与轮换，支持多 Key 池。
 - Key 校验带 TTL 缓存与防爆破限制。
+- **密钥不落版本库**：`gateway.yaml` 的 `api_keys` 默认为空，网关准入 Key 由 `GATEWAY_API_KEYS` 环境变量注入；Key 为空时 fail-closed（所有请求 `401`）。
+- **启动自检**：`GATEWAY_ENV=production` 时，若 Key 长度 < 32 或命中默认弱口令（如 `sk-gateway-dev`），网关拒绝启动；dev 环境仅告警。日志只记录弱 Key 数量，不输出 Key 本身。
+- **端口暴露**：Docker Compose 默认仅将 8000 端口绑定到宿主机回环地址（`127.0.0.1`），外网访问需经反向代理。
 
 ### 8.2 Prompt 注入防护（P0）
 - 系统提示词与用户输入隔离，渲染时对用户输入做定界/转义。
+- 模板渲染运行于 Jinja2 沙箱（`ImmutableSandboxedEnvironment`），模板内容不具备代码执行能力，越权表达式（如下划线属性访问）返回 `400 invalid_request`。
 - 对 `response_format` 约束场景强制输出 JSON，降低注入影响面。
 - 检测已知注入模式（角色伪装、指令覆盖等启发式规则），命中则拦截并返回错误。
 
 ### 8.3 边界防护
 - 请求体大小上限、`max_tokens` 上限、消息条数上限。
+- 已落地的声明式上限（由 Pydantic 在网关边界拦截，超限返回 `400 invalid_request`）：单条消息 ≤ 100,000 字符、消息合计 ≤ 512,000 字符、消息条数 ≤ 64、单条 `stop` ≤ 256 字符且最多 4 条、`template_vars` ≤ 64KB / 500 节点 / 深度 10、JSON Schema ≤ 1,000 节点 / 深度 20、模板内容 ≤ 100,000 字符。
 - 上游响应大小/时长上限，超限强制截断或断开。
 
 ### 8.4 敏感信息
@@ -368,6 +381,7 @@ Client / Agent SDK（≥10 个下游客户端）
 ### 8.5 上游安全
 - 上游调用使用网关侧密钥，不向前端透传。
 - 对上游地址做白名单/配置化管理，禁止任意 URL 请求（SSRF 防护）。
+- 结构化输出 Schema 中的 `$ref` 仅允许本地 `#/...` 指针，校验使用空引用注册表，杜绝客户端通过 Schema 触发服务端出网请求。
 
 ---
 
@@ -428,6 +442,7 @@ Client / Agent SDK（≥10 个下游客户端）
 16. **监控预留**：不集成 Prometheus/Grafana，但指标存储层预留导出接口与配置位（M1）。
 17. **追踪系统**：不集成 Jaeger/Tempo，追踪逻辑仅限网关内 Trace 记录（M3）。
 18. **CLI 工具**：提供指标查询、trace 查询、报表导出等命令（M5）。
+19. **模板与 Schema 安全**：模板渲染固定使用 Jinja2 沙箱环境；客户端 JSON Schema 仅允许本地 `$ref`，校验器以空引用注册表实例化，二者均在调用上游前完成拦截。
 
 ---
 
@@ -470,6 +485,7 @@ Client / Agent SDK（≥10 个下游客户端）
 ### 13.3 配置与密钥
 
 - `.env` / 环境变量：端口、worker 数、日志级别、DB 路径。
+- 网关准入 Key：仅通过 `GATEWAY_API_KEYS` 注入（逗号分隔），YAML 中 `api_keys` 默认留空；生产环境须设置 `GATEWAY_ENV=production` 以启用弱口令启动拦截。
 - YAML：Provider 定义（base_url、成本、thinking、容量、超时、模型别名）、模型列表、限流与熔断参数。
 - 热更新：文件变更 → Watcher 触发 → 原子替换，无需重启。
 
@@ -515,6 +531,17 @@ Client / Agent SDK（≥10 个下游客户端）
    - Prompt 注入防护当前为启发式规则，不可视为绝对安全边界。
 3. **验收标准**：满足第 7 节性能指标、第 9 节故障矩阵、第 12 节测试覆盖要求，且 Top 5 修复项（Trace 模型 GC 压力、SQLite 并发与计费幂等、跨 worker 熔断一致、取消后上游连接清理、HTTP 连接池与密钥轮换、配置热更新原子性）均落地验证。
 4. **下一步实施顺序建议**：核心管道（Pipeline + Router + Adapter）→ 容错（Retry/Fallback/CircuitBreaker）→ 观测（MetricsStore/Trace）→ 安全与限流 → E2E 测试 → Docker/CLI。
+
+---
+
+## 17. 变更记录（Change Log）
+
+| 版本 | 日期 | 变更内容 |
+| --- | --- | --- |
+| v1.3 | 2026-11-09 | 移除版本库内硬编码网关密钥并收紧部署面：① `gateway.yaml` 的 `api_keys` 置空，Key 统一由 `GATEWAY_API_KEYS` 注入；② 新增 `GATEWAY_ENV`（默认 `dev`），`production` 下拒绝启动弱口令（<32 字符或默认值），dev 仅告警；③ Docker Compose 的 8000 端口改为仅绑定 `127.0.0.1`（§8.1 / §13.3）。 |
+| v1.2 | 2026-11-09 | 补充成本治理与入参边界实现：① API Key 支持 `{key, user, project, budget_usd}` 主体绑定，服务端覆盖 user/project，预算取服务端硬配额与客户端请求值的更严者，限流与预算桶不再可被轮换字段绕过（§4.1 / §4.2 / §5.2）；② 声明式入参上限：消息长度/条数/合计、`stop`、`template_vars`、JSON Schema 节点数与深度、模板内容体积，超限统一 `400 invalid_request`（§5.2 / §8.3）。 |
+| v1.1 | 2026-11-09 | 补充已实现的安全细节：① PromptRenderer 使用 Jinja2 沙箱渲染，沙箱拦截返回 400（§4.5 / §8.2）；② Structured Output Validator 仅允许本地 `$ref`、使用空引用注册表，调用上游前拦截外部 `$ref`（§4.10 / §8.5）；③ AuthCheck 密钥按字节做常量时间比较，非法字节序列统一返回 401（§4.1）。Key 角色分级、服务端配额/主体映射、请求体与 Schema 体积上限在 v1.1 时尚未实现，故未声明。 |
+| v1.0 | 2026-09-11 | 初版规格，作为开发与验收基线。 |
 
 ---
 

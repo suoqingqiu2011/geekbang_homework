@@ -103,6 +103,20 @@ class HttpPoolConfig:
 
 
 @dataclass
+class KeyBinding:
+    """API Key 的服务端主体绑定与硬配额（SPEC §4.1 / §8.1）。
+
+    绑定后网关不再信任客户端自述的 user/project/budget_usd：
+    - user/project 由服务端覆盖，避免换 project 重置预算、轮换限流桶；
+    - budget_usd > 0 时作为该 Key 的硬性单请求上限，客户端只能收紧不能放开。
+    """
+
+    user: str = "anonymous"
+    project: str = "default"
+    budget_usd: float = 0.0
+
+
+@dataclass
 class ModelEntry:
     name: str
     provider: str
@@ -130,6 +144,8 @@ class AppConfig:
     circuit: CircuitConfig = field(default_factory=CircuitConfig)
     http_pool: HttpPoolConfig = field(default_factory=HttpPoolConfig)
     api_keys: list[str] = field(default_factory=list)
+    # key -> 主体绑定/硬配额；仅对以对象形式声明 api_keys 的条目生效
+    key_bindings: dict[str, KeyBinding] = field(default_factory=dict)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     available_models: list[ModelEntry] = field(default_factory=list)
 
@@ -183,6 +199,10 @@ class ConfigurationManager:
         if env_keys.strip():
             return [k.strip() for k in env_keys.split(",") if k.strip()]
         return list(self._config.api_keys)
+
+    def get_key_binding(self, key: str) -> Optional[KeyBinding]:
+        """返回该 Key 的服务端主体绑定；未绑定（含 env 注入的 Key）返回 None。"""
+        return self._config.key_bindings.get(key)
 
     # ── 加载与热更新 ─────────────────────────────────────────
     async def reload(self) -> bool:
@@ -269,10 +289,25 @@ class ConfigurationManager:
             read_timeout=self._env_float("POOL_READ_TO", _get(hp, "read_timeout", 60.0)),
         )
 
-        # api_keys
-        cfg.api_keys = [
-            str(k) for k in (_get(raw, "api_keys", []) or [])
-        ]
+        # api_keys：支持纯字符串（向后兼容）或
+        #   {key, user, project, budget_usd} 对象（服务端主体绑定 + 硬配额）
+        cfg.api_keys = []
+        cfg.key_bindings = {}
+        for item in (_get(raw, "api_keys", []) or []):
+            if isinstance(item, dict):
+                key = str(_get(item, "key", "") or "")
+                if not key:
+                    continue
+                cfg.api_keys.append(key)
+                cfg.key_bindings[key] = KeyBinding(
+                    user=str(_get(item, "user", "anonymous")),
+                    project=str(_get(item, "project", "default")),
+                    budget_usd=float(_get(item, "budget_usd", 0.0)),
+                )
+                continue
+            key = str(item)
+            if key:
+                cfg.api_keys.append(key)
 
         # providers
         cfg.providers = {}

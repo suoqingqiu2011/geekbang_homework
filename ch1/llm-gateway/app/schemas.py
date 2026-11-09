@@ -2,24 +2,69 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# ── 边界上限（SPEC §8.3）：入参在网关边界拦截，避免超长文本/超深结构
+#    在令牌估算、注入检测、Schema 校验等热路径上放大 CPU 与内存开销。
+MAX_MESSAGE_CHARS = 100_000          # 单条消息内容
+MAX_TOTAL_PROMPT_CHARS = 512_000     # 全部消息内容合计
+MAX_MESSAGES = 64                    # 消息条数（与既有校验保持一致）
+MAX_SCHEMA_NODES = 1_000             # JSON Schema 节点数
+MAX_SCHEMA_DEPTH = 20                # JSON Schema 嵌套深度
+MAX_VARS_BYTES = 64_000              # template_vars 序列化后体积
+MAX_VARS_NODES = 500                 # template_vars 节点数
+MAX_VARS_DEPTH = 10                  # template_vars 嵌套深度
+
+
+def _count_nodes_and_depth(
+    value: Any,
+    max_nodes: int = MAX_SCHEMA_NODES,
+    max_depth: int = MAX_SCHEMA_DEPTH,
+) -> tuple[int, int]:
+    """迭代统计 JSON 结构的节点数与最大嵌套深度（避免递归触发 RecursionError）。"""
+    nodes = 0
+    depth_max = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if depth > depth_max:
+            depth_max = depth
+        if nodes > max_nodes or depth_max > max_depth:
+            # 已确定超限，提前返回不必继续遍历
+            return nodes, depth_max
+        if isinstance(current, dict):
+            stack.extend((v, depth + 1) for v in current.values())
+        elif isinstance(current, list):
+            stack.extend((v, depth + 1) for v in current)
+    return nodes, depth_max
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] = "user"
-    content: str
+    content: str = Field(max_length=MAX_MESSAGE_CHARS)
     # 预留：OpenAI 协议中 role="tool" 消息用于回传工具执行结果，
     # 通过 tool_call_id 关联对应 assistants 消息里的 tool_calls。
-    tool_call_id: Optional[str] = None
+    tool_call_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class JsonSchemaFormat(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=128)
     # 字段内部命名 schema_，通过 alias="schema" 保持 wire 层键名不变，
     # 避免遮蔽 BaseModel 废弃类方法 schema() 触发 Pydantic 遮蔽警告。
     schema_: dict[str, Any] = Field(alias="schema", serialization_alias="schema")
+
+    @model_validator(mode="after")
+    def _check_complexity(self) -> "JsonSchemaFormat":
+        nodes, depth = _count_nodes_and_depth(self.schema_)
+        if nodes > MAX_SCHEMA_NODES:
+            raise ValueError(f"json_schema too complex: {nodes} nodes (max {MAX_SCHEMA_NODES})")
+        if depth > MAX_SCHEMA_DEPTH:
+            raise ValueError(f"json_schema nested too deeply: {depth} (max {MAX_SCHEMA_DEPTH})")
+        return self
 
 
 class ResponseFormat(BaseModel):
@@ -30,8 +75,8 @@ class ResponseFormat(BaseModel):
 class ChatCompletionRequest(BaseModel):
     """OpenAI 兼容请求体（含网关扩展字段）。"""
 
-    model: Optional[str] = None          # None → 路由器自动选择
-    messages: list[ChatMessage] = Field(min_length=1)
+    model: Optional[str] = Field(default=None, max_length=256)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=MAX_MESSAGES)
     stream: bool = False
     # 仅对 stream + response_format 生效：先缓冲完整输出并完成校验/修复，
     # 校验通过后再一次性下发，避免客户端先收到不可用内容。
@@ -51,11 +96,11 @@ class ChatCompletionRequest(BaseModel):
     top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
 
     # ── 网关扩展字段 ────────────────────────────────────────
-    user: str = "anonymous"
-    project: str = "default"
+    user: str = Field(default="anonymous", max_length=128)
+    project: str = Field(default="default", max_length=128)
     budget_usd: float = 0.0              # 0 = 不限制（SPEC §5.2）
-    trace_id: Optional[str] = None
-    template_id: Optional[str] = None    # 提示词模板（SPEC §4.5）
+    trace_id: Optional[str] = Field(default=None, max_length=128)
+    template_id: Optional[str] = Field(default=None, max_length=128)  # 提示词模板（SPEC §4.5）
     template_version: Optional[int] = Field(default=None, ge=1)  # None = 使用最新版本
     template_vars: dict[str, Any] = Field(default_factory=dict)
     thinking: bool = False               # 要求高思考能力（路由权重）
@@ -72,6 +117,13 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("buffer_until_valid requires stream=true")
         if self.buffer_until_valid and self.response_format is None:
             raise ValueError("buffer_until_valid requires response_format")
+        # 总量上限：单条与条数各自受限仍可能叠加过大，这里再做一次合计约束
+        total_chars = sum(len(m.content) for m in self.messages)
+        if total_chars > MAX_TOTAL_PROMPT_CHARS:
+            raise ValueError(
+                f"total prompt content too large: {total_chars} chars "
+                f"(max {MAX_TOTAL_PROMPT_CHARS})"
+            )
         return self
 
     @field_validator("stop")
@@ -85,6 +137,22 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("stop supports at most 4 sequences")
         if any(not seq for seq in seqs):
             raise ValueError("stop sequences must be non-empty strings")
+        if any(len(seq) > 256 for seq in seqs):
+            raise ValueError("each stop sequence must be <= 256 characters")
+        return v
+
+    @field_validator("template_vars")
+    @classmethod
+    def _limit_template_vars(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """模板变量体积/复杂度上限，避免超大 JSON 进入渲染与追踪链路。"""
+        size = len(json.dumps(v, ensure_ascii=False))
+        if size > MAX_VARS_BYTES:
+            raise ValueError(
+                f"template_vars too large: {size} bytes (max {MAX_VARS_BYTES})"
+            )
+        nodes, depth = _count_nodes_and_depth(v, MAX_VARS_NODES, MAX_VARS_DEPTH)
+        if nodes > MAX_VARS_NODES or depth > MAX_VARS_DEPTH:
+            raise ValueError("template_vars structure too large or too deeply nested")
         return v
 
     @field_validator("messages")
@@ -143,11 +211,26 @@ class TemplateOut(BaseModel):
 
 
 class TemplateUpsertRequest(BaseModel):
-    template_id: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    content: str = Field(min_length=1)
+    template_id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=200)
+    # 模板内容同样进入渲染热路径，限制体积避免超大模板拖慢/占用内存
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class TemplateRenderRequest(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
     version: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("variables")
+    @classmethod
+    def _limit_variables(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """渲染入口同样受体积/复杂度上限约束，避免绕过 chat 侧校验。"""
+        size = len(json.dumps(v, ensure_ascii=False))
+        if size > MAX_VARS_BYTES:
+            raise ValueError(
+                f"variables too large: {size} bytes (max {MAX_VARS_BYTES})"
+            )
+        nodes, depth = _count_nodes_and_depth(v, MAX_VARS_NODES, MAX_VARS_DEPTH)
+        if nodes > MAX_VARS_NODES or depth > MAX_VARS_DEPTH:
+            raise ValueError("variables structure too large or too deeply nested")
+        return v

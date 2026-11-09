@@ -27,6 +27,7 @@ from ..core.router import estimate_prompt_tokens
 from ..core.trace_freeze import TraceFreezeRecord
 from ..errors import (
     GatewayError,
+    InvalidRequestError,
     RateLimitExceededError,
     StructuredOutputError,
     UpstreamError,
@@ -133,6 +134,16 @@ async def list_models(request: Request) -> ModelsResponse:
 # ─────────────────────────────────────────────────────────────
 # POST /v1/chat/completions
 # ─────────────────────────────────────────────────────────────
+def _tightest_budget(bound: float, requested: float) -> float:
+    """取"更严"的预算：服务端绑定配额是硬上限，客户端只能收紧。
+
+    0 表示"不限制"（SPEC §5.2），因此 0 不参与取最小值；
+    两者都为 0 时才真正不限制。
+    """
+    limits = [value for value in (bound, requested) if value > 0]
+    return min(limits) if limits else 0.0
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
     """请求入口：统一记录请求量/耗时指标后转交管道实现。"""
@@ -157,7 +168,18 @@ async def _chat_completions_impl(
     request: Request, body: ChatCompletionRequest, ctx: AppContext
 ):
     # 1. 鉴权
-    await ctx.auth.check(request.headers.get("authorization"), ctx.config_manager.get_api_keys)
+    key = await ctx.auth.check(
+        request.headers.get("authorization"), ctx.config_manager.get_api_keys
+    )
+
+    # ★ 服务端主体绑定（SPEC §4.1 / §8.1）：绑定 Key 的 user/project 以服务端为准，
+    #   预算取"服务端硬配额与客户端请求值中更严者"，避免客户端换 project 重置
+    #   预算/限流桶，或直接把 budget_usd 填 0 绕过成本管控。
+    binding = ctx.config_manager.get_key_binding(key)
+    if binding is not None:
+        body.user = binding.user
+        body.project = binding.project
+        body.budget_usd = _tightest_budget(binding.budget_usd, body.budget_usd)
 
     # 2. 限流（per-model > per-endpoint > per-project > per-user）
     allowed, retry_after, layer = await ctx.rate_limiter.check(
@@ -803,11 +825,33 @@ def _completion_id(trace_id: str) -> str:
     return f"chatcmpl-{trace_id.replace('-', '')[:24]}"
 
 
+def _assert_local_schema_refs(node: Any) -> None:
+    """拒绝客户端 schema 中的外部 $ref（SSRF 前置于请求上游之前）。
+
+    本地指针 `#/...` 是合法用法；任何非 `#` 开头的 `$ref` 都可能在
+    jsonschema 校验时触发远程抓取，故在管道入口直接拒绝（400），
+    避免先付费调用上游再发现 schema 不可用。
+    """
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and not ref.startswith("#"):
+            raise InvalidRequestError(
+                "response_format.json_schema may only use local '#/...' $ref references"
+            )
+        for value in node.values():
+            _assert_local_schema_refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            _assert_local_schema_refs(value)
+
+
 def _resolve_schema(body: ChatCompletionRequest) -> Optional[dict[str, Any]]:
     if body.response_format is None:
         return None
     if body.response_format.json_schema is not None:
-        return body.response_format.json_schema.schema_
+        schema = body.response_format.json_schema.schema_
+        _assert_local_schema_refs(schema)
+        return schema
     return {"type": "object"}  # json_object 模式：至少要求合法 JSON 对象
 
 

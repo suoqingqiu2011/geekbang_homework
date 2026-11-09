@@ -12,7 +12,9 @@ import logging
 import re
 from typing import Any, Optional
 
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2.exceptions import SecurityError
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from ..errors import InvalidRequestError, NotFoundError, PromptMissingVarsError
 from ..storage.metrics_store import MetricsStore
@@ -27,7 +29,13 @@ class PromptRenderer:
 
     def __init__(self, store: MetricsStore) -> None:
         self._store = store
-        self._env = Environment(undefined=StrictUndefined, autoescape=False)
+        # ★ 安全：模板内容可由持有网关 Key 的调用方经 /v1/templates 写入，
+        #   绝不能用普通 Environment（{{ ''.__class__.__mro__ }} 一类属性链可直接
+        #   逃逸到 os.popen 执行任意命令）。沙箱环境禁止访问下划线属性与危险
+        #   内置对象，模板即数据而非代码。
+        self._env = ImmutableSandboxedEnvironment(
+            undefined=StrictUndefined, autoescape=False
+        )
         # 内存缓存：(template_id, version) -> content（模板更新由 upsert 后失效）
         self._cache: dict[tuple[str, int | None], str] = {}
 
@@ -65,6 +73,11 @@ class PromptRenderer:
             return self._env.from_string(content).render(variables)
         except UndefinedError as exc:
             raise PromptMissingVarsError(f"Prompt template '{template_id}' undefined variable: {exc}") from exc
+        except SecurityError as exc:
+            # 沙箱拦截（访问下划线属性/危险内置对象等）：属非法模板，按请求错误返回
+            raise InvalidRequestError(
+                f"Prompt template '{template_id}' uses unsupported expression: {exc}"
+            ) from exc
         except TemplateSyntaxError as exc:
             raise InvalidRequestError(f"Prompt template '{template_id}' syntax error: {exc}") from exc
 

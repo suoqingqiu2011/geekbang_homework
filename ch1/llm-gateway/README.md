@@ -85,8 +85,23 @@ curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 
 网关准入使用统一 Bearer Key，来源优先级为 **环境变量 > `gateway.yaml`**：
 
-- `gateway.yaml` 的 `api_keys`（默认含 `sk-gateway-dev`、`sk-gateway-test`）；
-- 设置 `GATEWAY_API_KEYS`（逗号分隔）后，YAML 中的 key 被忽略。
+- `gateway.yaml` 的 `api_keys` 默认为空（不把任何 Key 写入版本库）；
+- 设置 `GATEWAY_API_KEYS`（逗号分隔）后生效。本地开发可沿用 `.env.example` 中的占位 Key，生产环境请替换为随机串。
+
+> **生产部署必读**：设置 `GATEWAY_ENV=production` 后，若 Key 长度 < 32 或命中默认弱口令（如 `sk-gateway-dev`），网关会**拒绝启动**。生成随机 Key：`python -c "import secrets; print(secrets.token_urlsafe(32))"`。dev 环境仅打印告警；Key 列表为空时所有请求返回 `401`（fail-closed）。
+
+`api_keys` 除纯字符串外，还支持对象写法，用于把 Key 绑定到固定主体并施加硬配额：
+
+```yaml
+api_keys:
+  - sk-gateway-dev              # 纯字符串：不绑定主体，行为与旧版一致
+  - key: sk-gateway-team-a
+    user: team-a                # 服务端覆盖请求体 user
+    project: proj-a             # 服务端覆盖请求体 project（限流桶与预算累计按此归集）
+    budget_usd: 0.05            # 该 Key 的单请求硬性预算上限
+```
+
+> **接入注意（绑定 Key）**：绑定后 `user` / `project` 以服务端配置为准，请求体中的同名字段会被忽略；`budget_usd` 不再是"客户端说了算"——实际生效值取 **服务端硬配额与请求值中更严者**。因此客户端传 `budget_usd: 0`（旧约定为"不限制"）在绑定 Key 上会变为受硬配额约束，可能首次出现 `402 budget_exhausted`。接入绑定 Key 时请按服务端配额评估单次请求成本，不要再依赖 `0 = 不限制`。通过 `GATEWAY_API_KEYS` 环境变量注入的 Key 不携带绑定信息，行为与纯字符串一致。
 
 上游 Key 均从环境变量读取，不写入配置文件：
 
@@ -114,7 +129,7 @@ curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer sk-gateway-dev"
 | `rate_limit` | 令牌桶速率与各层上限 |
 | `circuit_breaker` | 失败阈值、恢复时间、半开探针数 |
 | `http_pool` | 连接池大小与上游超时 |
-| `api_keys` | 网关准入 Key |
+| `api_keys` | 网关准入 Key；支持 `{key, user, project, budget_usd}` 对象写法做主体绑定与硬配额（见「鉴权与 Provider Key」） |
 | `providers` | 供应商地址、Key 环境变量、价格、能力、模型别名 |
 | `available_models` | 对外模型名、所属供应商、路由权重、可选上下文窗口 |
 
@@ -221,9 +236,9 @@ providers:
 | `seed` | int | 尽力而为的可复现种子 |
 | `logprobs` | bool | 返回 token 对数概率，仅非流式生效 |
 | `top_logprobs` | int，0~20 | 需同时 `logprobs: true` |
-| `user` | string | 用户标识，默认 `anonymous` |
-| `project` | string | 项目标识，默认 `default`；参与限流与预算累计 |
-| `budget_usd` | float | 项目预算；`0` 表示不限制 |
+| `user` | string | 用户标识，默认 `anonymous`；Key 绑定主体时被服务端值覆盖 |
+| `project` | string | 项目标识，默认 `default`；参与限流与预算累计；Key 绑定主体时被服务端值覆盖 |
+| `budget_usd` | float | 项目预算；`0` 表示不限制。Key 配置了硬配额时，实际生效值 = `min(硬配额, budget_usd)`（忽略其中的 `0`），客户端只能收紧 |
 | `thinking` | bool | 要求更高思考能力，路由时提高能力权重 |
 | `trace_id` | string，可选 | 调用方指定追踪 ID |
 | `template_id` | string，可选 | 引用提示词模板 |
@@ -493,7 +508,7 @@ JSON
 
 ### 模板管理 HTTP 端点（`/v1/templates`）
 
-模板管理原本仅 CLI 可用（`python -m cli.gateway_cli templates ...`），现已暴露为 REST 端点，复用网关统一 Bearer 鉴权（默认 key 见 `config/gateway.yaml` 的 `api_keys`；若设置了 `GATEWAY_API_KEYS` 环境变量，则以环境变量为准，YAML 中的 key 被忽略）。
+模板管理原本仅 CLI 可用（`python -m cli.gateway_cli templates ...`），现已暴露为 REST 端点，复用网关统一 Bearer 鉴权（Key 取自 `GATEWAY_API_KEYS`；`config/gateway.yaml` 的 `api_keys` 默认留空，仅在未设置环境变量时作为回退来源）。
 
 语义约定：
 
@@ -957,7 +972,7 @@ httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 
 演示环境配置：deepseek 的 `api_base_url` 临时指向不可达地址（用于强制触发重试→fallback），kimi 未配置 `KIMI_API_KEY`，qwen 配置真实 Key。请求未指定 `model`，触发完整候选链。
 
-请求（网关鉴权 key 取 `config/gateway.yaml` 中 `api_keys` 的任一值，本地默认 `sk-gateway-dev`）：
+请求（网关鉴权 key 取环境变量 `GATEWAY_API_KEYS` 的任一值；本地开发按 `.env.example` 默认是 `sk-gateway-dev`，生产请替换为随机串）：
 
 ```powershell
 # PowerShell

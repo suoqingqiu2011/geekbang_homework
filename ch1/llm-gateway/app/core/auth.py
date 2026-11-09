@@ -19,6 +19,27 @@ from ..errors import InvalidAuthError
 
 logger = logging.getLogger("llm-gateway.auth")
 
+# 网关 Key 强度下限（SPEC §8.1）。短于此长度或命中默认值的 Key 视为弱口令，
+# 生产环境启动时直接拒绝服务，避免"按默认配置部署 = 弱口令对外可用"。
+MIN_GATEWAY_KEY_LENGTH = 32
+_WEAK_GATEWAY_KEYS = frozenset({
+    "sk-gateway-dev",
+    "sk-gateway-test",
+    "dev",
+    "test",
+    "changeme",
+    "password",
+})
+
+
+def find_weak_keys(keys: list[str]) -> list[str]:
+    """返回长度不足或命中默认弱口令的网关 Key（仅返回 Key 本身，调用方勿打印）。"""
+    return [
+        key
+        for key in keys
+        if len(key) < MIN_GATEWAY_KEY_LENGTH or key.strip().lower() in _WEAK_GATEWAY_KEYS
+    ]
+
 
 class AuthCheck:
     """API Key 校验器。"""
@@ -54,7 +75,12 @@ class AuthCheck:
                 raise InvalidAuthError("Invalid API key.")
             return key
 
-        valid = any(hmac.compare_digest(key, k) for k in valid_keys if k)
+        # ★ 安全：compare_digest 对含非 ASCII 字符的 str 会抛 TypeError（→ 500），
+        #   统一编码为 bytes 后再做常量时间比较，任意字节序列均按"不匹配"处理。
+        valid = any(
+            hmac.compare_digest(key.encode("utf-8"), k.encode("utf-8"))
+            for k in valid_keys if k
+        )
         self._cache[cache_key] = valid
         if not valid:
             logger.warning("Auth failed: invalid API key (fingerprint=%s...)", fingerprint[:8])

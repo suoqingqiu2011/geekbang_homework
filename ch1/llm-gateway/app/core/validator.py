@@ -16,10 +16,19 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 from jsonschema import Draft7Validator, ValidationError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from ..errors import PromptInjectionDetectedError, StructuredOutputError
 
 logger = logging.getLogger("llm-gateway.validator")
+
+# ★ 安全：空 Registry = 不注册任何远程资源。schema 完全由客户端提供，
+#   若放任默认行为，`{"$ref": "http://169.254.169.254/..."}` 会让网关以
+#   服务端网络位置发起请求（SSRF）。空 registry 至多解析 `#/...` 本地指针，
+#   外部 `$ref` 一律抛 Unresolvable，绝不联网。
+_LOCAL_ONLY_REGISTRY = Registry()
+
 
 # ── Prompt 注入启发式规则（SPEC §8.2：不视为绝对安全边界）────────
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
@@ -66,7 +75,7 @@ class StructuredOutputValidator:
         if cached is not None:
             self._schema_cache.move_to_end(key)
             return cached
-        cached = Draft7Validator(schema)
+        cached = Draft7Validator(schema, registry=_LOCAL_ONLY_REGISTRY)
         self._schema_cache[key] = cached
         self._schema_cache.move_to_end(key)
         if len(self._schema_cache) > self._max_schema_cache:
@@ -84,9 +93,14 @@ class StructuredOutputValidator:
         except json.JSONDecodeError:
             return None, "invalid_json"
         validator = self._validator(schema)
-        if validator.is_valid(data):
-            return data, None
-        errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
+        try:
+            if validator.is_valid(data):
+                return data, None
+            errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
+        except Unresolvable as exc:
+            # schema 含无法解析的外部 $ref：按校验失败处理（绝不发起网络请求）
+            logger.warning("Unresolvable $ref in client schema: %s", exc)
+            return data, "unresolvable_ref"
         return data, str(errors[0].message) if errors else "schema_mismatch"
 
     # ── 自动修复 ─────────────────────────────────────────────

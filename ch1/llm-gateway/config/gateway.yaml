@@ -46,10 +46,19 @@ http_pool:
   connect_timeout: 5.0
   read_timeout: 60.0
 
-api_keys:
-  # Gateway-level keys (Bearer auth). Env override supported.
-  - sk-gateway-dev
-  - sk-gateway-test
+api_keys: []
+# 网关准入 Key 不再写死在版本库，统一由环境变量注入（逗号分隔）：
+#   GATEWAY_API_KEYS=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# 生成方式：python -c "import secrets; print(secrets.token_urlsafe(32))"
+# 注意：长度 < 32 或使用默认弱口令时，GATEWAY_ENV=production 下网关将拒绝启动。
+#
+# 主体绑定写法（可选）：绑定后 user/project 以服务端为准，
+# budget_usd 为该 Key 的硬性单请求上限，客户端只能收紧不能放开。
+# api_keys:
+#   - key: sk-team-a-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#     user: team-a
+#     project: proj-a
+#     budget_usd: 0.05
 
 providers:
   deepseek:
