@@ -204,8 +204,6 @@ Git Bash / MINGW64（与上面 PowerShell 版本功能等效）：
 
 > `check_env.py` 只按后端检查所需依赖：`local` 检查 torch / sentence-transformers / huggingface，`cloud` 只检查核心依赖。LLM key 只输出状态与 `[WARN]`，不阻断自检；step2/step3 启动时仍要求 `DEEPSEEK_API_KEY`（主模型）。
 
-> ⚠️ **注意**：本文档中形如 `torch 2.5.1+cpu`、`st 3.4.1`、`hf embed ok` 的内容是**程序输出示例**，不是命令。直接粘贴到终端会得到 `bash: torch: command not found` —— 这不是缺依赖，而是把输出当成了命令。
-
 ---
 
 ## 3. 依赖安装
