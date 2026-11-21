@@ -1,0 +1,1 @@
+{"version":3,"file":"terminal-question.d.ts","sourceRoot":"","sources":["../../src/utils/terminal-question.ts"],"names":[],"mappings":"AAEA,gGAAgG;AAChG,wBAAsB,gBAAgB,CACrC,OAAO,EAAE,MAAM,EACf,OAAO,EAAE;IACR,MAAM,EAAE,MAAM,CAAC,cAAc,CAAC;IAC9B,MAAM,EAAE,WAAW,CAAC;IACpB,4EAA4E;IAC5E,WAAW,CAAC,EAAE,MAAM,IAAI,CAAC;CACzB,GACC,OAAO,CAAC,MAAM,CAAC,CAiBjB"}

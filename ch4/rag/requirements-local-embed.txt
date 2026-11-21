@@ -1,0 +1,4 @@
+-r requirements.txt
+llama-index-embeddings-huggingface
+sentence-transformers>=3.0,<4
+torch>=2.2,<2.6

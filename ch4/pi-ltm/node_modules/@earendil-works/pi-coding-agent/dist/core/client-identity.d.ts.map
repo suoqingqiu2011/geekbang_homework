@@ -1,0 +1,1 @@
+{"version":3,"file":"client-identity.d.ts","sourceRoot":"","sources":["../../src/core/client-identity.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,KAAK,cAAc,EAAkB,MAAM,uBAAuB,CAAC;AAE5E,OAAO,KAAK,EAAE,eAAe,EAAE,MAAM,uBAAuB,CAAC;AAG7D;;;GAGG;AACH,wBAAgB,iBAAiB,CAAC,eAAe,EAAE,eAAe,GAAG,cAAc,CAMlF"}

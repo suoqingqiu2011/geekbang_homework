@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "okfCli": "node_modules/pi-okf/dist/cli.js",
+  "allowedRoots": [],
+  "scopes": {
+    "project": { "root": ".pi/ltm" },
+    "global": { "root": "~/.pi/ltm" }
+  },
+  "session": {
+    "injectOnSessionStart": true,
+    "warmIndexOnSessionStart": true,
+    "briefMaxChars": 1200,
+    "maxKeysPerScope": 20
+  },
+  "lock": { "timeoutMs": 5000, "staleMs": 10000, "retries": 8 },
+  "gate": { "validateOnWrite": true, "rollbackOnInvalid": true },
+  "rpcTimeoutMs": 20000
+}

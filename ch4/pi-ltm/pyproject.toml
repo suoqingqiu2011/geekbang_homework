@@ -1,0 +1,11 @@
+[project]
+name = "pi-ltm"
+version = "0.1.0"
+description = "Project-scoped long-term memory core for pi"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+# Tests are pure stdlib unittest; the globally installed pytest-asyncio plugin is
+# unused and calls the Python 3.14 deprecated asyncio.get_event_loop_policy().
+addopts = "-p no:asyncio"

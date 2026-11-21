@@ -1,0 +1,22 @@
+{
+  "name": "pi-okf-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Project-scoped long-term memory for pi, persisted as OKF v0.2 bundles",
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
+  "scripts": {
+    "start": "node scripts/pi-env.mjs -e ./src/extension.ts",
+    "pi": "node scripts/pi-env.mjs",
+    "test:extension": "node --experimental-strip-types --test tests/extension.test.mjs"
+  },
+  "dependencies": {
+    "pi-okf": "^0.4.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

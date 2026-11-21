@@ -1,0 +1,30 @@
+---
+type: "Memory"
+title: "会话测试入口"
+description: "测试文件：`tests/auth/test_session.py`"
+generated:
+  by: "process:pi-okf-memory"
+  at: "2026-11-19T04:05:05.502Z"
+id: "mem_f14c56a2"
+key: "session-test-entry"
+project: "C:\\projet\\homework\\ch4\\pi-ltm"
+projectId: "300a6590f1bc"
+sources:
+  -
+    resource: "tests/auth/test_session.py"
+  -
+    resource: "docs/测试说明.md"
+tags: ["memory"]
+status: "deprecated"
+revision: 2
+---
+
+# Content
+
+- 测试文件：`tests/auth/test_session.py`
+- 运行命令：`python -m unittest tests.auth.test_session -v`
+
+# Citations
+
+[1] tests/auth/test_session.py
+[2] docs/测试说明.md

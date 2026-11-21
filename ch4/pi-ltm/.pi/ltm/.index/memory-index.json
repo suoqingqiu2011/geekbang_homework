@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "builtAt": "2026-11-19T05:31:07.300Z",
+  "entries": {
+    "core-test-entry-52175d84.md": {
+      "mtime": 1795062416.677694,
+      "size": 576,
+      "record": {
+        "id": "mem_52175d84",
+        "key": "core-test-entry",
+        "title": "核心单元测试入口",
+        "description": "测试文件：`tests/test_memory.py`",
+        "project": "C:\\projet\\homework\\ch4\\pi-ltm",
+        "project_id": "300a6590f1bc",
+        "sources": [
+          "tests/test_memory.py"
+        ],
+        "tags": [
+          "memory",
+          "testing",
+          "unittest",
+          "pi-ltm"
+        ],
+        "status": "stable",
+        "revision": 3,
+        "generated_by": "process:pi-okf-memory",
+        "generated_at": "2026-11-19T04:26:56.677Z",
+        "content": "- 测试文件：`tests/test_memory.py`\n- 运行命令：`python -m unittest tests.test_memory -v`",
+        "frontmatter": {
+          "type": "Memory",
+          "title": "核心单元测试入口",
+          "description": "测试文件：`tests/test_memory.py`",
+          "generated": {
+            "by": "process:pi-okf-memory",
+            "at": "2026-11-19T04:26:56.677Z"
+          },
+          "id": "mem_52175d84",
+          "key": "core-test-entry",
+          "project": "C:\\projet\\homework\\ch4\\pi-ltm",
+          "projectId": "300a6590f1bc",
+          "sources": [
+            {
+              "resource": "tests/test_memory.py"
+            }
+          ],
+          "tags": [
+            "memory",
+            "testing",
+            "unittest",
+            "pi-ltm"
+          ],
+          "status": "stable",
+          "revision": 3
+        }
+      }
+    },
+    "session-test-entry-06dbced0.md": {
+      "mtime": 1795066266.7509186,
+      "size": 997,
+      "record": {
+        "id": "mem_06dbced0",
+        "key": "session-test-entry",
+        "title": "会话测试入口",
+        "description": "测试文件：`tests/auth/test_session.py`",
+        "project": "C:\\projet\\homework\\ch4\\pi-ltm",
+        "project_id": "300a6590f1bc",
+        "sources": [
+          "tests/auth/test_session.py"
+        ],
+        "tags": [
+          "memory",
+          "testing",
+          "e2e",
+          "login_demo",
+          "unittest",
+          "migrated"
+        ],
+        "status": "stable",
+        "revision": 5,
+        "generated_by": "process:pi-okf-memory",
+        "generated_at": "2026-11-19T05:31:06.751Z",
+        "content": "- 测试文件：`tests/auth/test_session.py`\n- 运行命令：`python -m unittest tests.auth.test_session -v`\n- 已核对：入口位于 `tests/auth/`（`tests/auth/__init__.py` 为包标记），需在 `pi-ltm` 根目录运行；`find_plugin_root()` 会向上定位项目根，故位于子目录仍能解析路径\n- 实测：2026-11-19 运行 `Ran 5 tests in 0.886s` → `OK`\n- 前置条件：`login_demo` 在 `../login_demo`（`LOGIN_DEMO_ROOT` 可覆盖），端口 3001 空闲",
+        "frontmatter": {
+          "type": "Memory",
+          "title": "会话测试入口",
+          "description": "测试文件：`tests/auth/test_session.py`",
+          "generated": {
+            "by": "process:pi-okf-memory",
+            "at": "2026-11-19T05:31:06.751Z"
+          },
+          "id": "mem_06dbced0",
+          "key": "session-test-entry",
+          "project": "C:\\projet\\homework\\ch4\\pi-ltm",
+          "projectId": "300a6590f1bc",
+          "sources": [
+            {
+              "resource": "tests/auth/test_session.py"
+            }
+          ],
+          "tags": [
+            "memory",
+            "testing",
+            "e2e",
+            "login_demo",
+            "unittest",
+            "migrated"
+          ],
+          "status": "stable",
+          "revision": 5
+        }
+      }
+    }
+  }
+}
