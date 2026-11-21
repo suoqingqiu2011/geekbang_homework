@@ -334,7 +334,9 @@ jq -c 'select(.type == "message" and .message.role == "toolResult" and .message.
 
 默认软删除：`status` 置为 `deprecated` 并移动到 `okf/trash/<name>.md.orig`（保留追溯）。工具参数加 `hard: true` 才真删文件。
 
-> 删除key为session-test-entry的记忆返回的信息：
+
+删除key为session-test-entry的记忆返回的信息：
+
 ![删除key为session-test-entry的记忆返回的信息](../docs/ltm/session删除记忆.png)
 
 ### 4.5 删除后重新写入同一 key
@@ -369,10 +371,14 @@ jq -c 'select(.type == "message" and .message.role == "toolResult" and .message.
 - 如果只是内容变化、key 仍有效，应使用 §4.3 的 `memory_update`，不要先删后写，以免丢失 `revision` 历史。
 - 不经 pi 直接调用时，对应先 `op: "delete"` 再 `op: "write"`，命令格式见 §4.10。
 
-> key为session-test-entry重新写入返回的信息：
+
+key为session-test-entry重新写入返回的信息：
+
 ![key为session-test-entry重新写入返回的信息](../docs/ltm/session重新写入记忆.png)
 
-> 读取重写后的记忆的返回信息：
+
+读取重写后的记忆的返回信息：
+
 ![读取重写后的记忆的返回信息](../docs/ltm/session记忆读取.png)
 
 > 退出并重新进入 pi 会话模式后再次读取记忆，返回内容保持一致，说明长期记忆已成功持久化。
