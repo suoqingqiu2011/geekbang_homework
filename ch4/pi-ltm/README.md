@@ -163,7 +163,8 @@ key 用 core-test-entry，标题为 “核心单元测试入口”，
 来源是 tests/test_memory.py
 ```
 
-> 首次写入核心单元测试记忆，建库的同时修复了 OKF 相关问题：
+首次写入核心单元测试记忆，建库的同时修复了 OKF 相关问题：
+
 ![第一次写入记忆建库的同时修复okf的问题](../docs/ltm/core第一次写入落盘.png)
 
 #### 4.1.2 非首次写入记忆
@@ -201,7 +202,8 @@ key 用 core-test-entry，标题为 “核心单元测试入口”，
 }
 ```
 
->  key为session-test-entry写入记忆返回的信息： 
+key为session-test-entry写入记忆返回的信息： 
+
 ![key为session-test-entry写入记忆返回的信息](../docs/ltm/session写入记忆.png)
 
 
@@ -320,7 +322,8 @@ jq -c 'select(.type == "message" and .message.role == "toolResult" and .message.
 
 > 当 `source_status` 为 `changed` / `missing` 时，更新必须带 `confirm: true` 和 `reason`，旧 revision 会记录到 `supersedes`；用 `lifecycle: "expired"` 标记过期而不是直接删除。
 
-> 会话测试迁移：
+会话测试迁移：
+
 ![会话测试迁移](../docs/ltm/session迁移更新.png)
 
 ### 4.4 删除记忆
