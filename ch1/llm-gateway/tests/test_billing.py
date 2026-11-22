@@ -68,6 +68,9 @@ async def test_query_summary(tmp_path):
         s = await store.query_summary()
         assert s["requests"] == 1
         assert s["errors"] == 1
+        assert s["total_requests"] == 2
+        assert s["error_rate"] == 0.5
+        assert s["days"] == 0
         assert s["prompt_tokens"] == 10
         assert s["completion_tokens"] == 5
         assert s["total_tokens"] == 15

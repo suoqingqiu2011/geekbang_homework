@@ -17,12 +17,12 @@ from functools import lru_cache
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from ..adapters.registry import get_adapter
 from ..context import AppContext
+from ..core.cancellation import ClientDisconnected
 from ..core.config_manager import AppConfig
-from ..core.retry_fallback import RetryPolicy
 from ..core.router import estimate_prompt_tokens
 from ..core.trace_freeze import TraceFreezeRecord
 from ..errors import (
@@ -41,7 +41,6 @@ from ..schemas import (
     ModelsResponse,
     UsageOut,
 )
-from ..storage.metrics_store import MetricsStore
 
 logger = logging.getLogger("llm-gateway.api.chat")
 
@@ -278,58 +277,34 @@ async def _handle_completion(
     def _adapter_for(candidate):
         return get_adapter(cfg.providers[candidate.provider], ctx.http_pool)
 
-    async def call_one(candidate, probe=False, attempt=1):
+    async def call_one(candidate, attempt=1, rf_degraded=False):
         adapter = _adapter_for(candidate)
         capability = cfg.providers[candidate.provider].structured_output
-        upstream_rf = _upstream_response_format(body, capability)
-        upstream_msgs = _upstream_messages(messages, upstream_rf, schema)
-        try:
-            ctx.metrics.inc_upstream_attempt()
-            result = await adapter.chat_complete(
-                upstream_msgs,
-                candidate.upstream_model,
-                temperature=body.temperature,
-                max_tokens=body.max_tokens,
-                top_p=body.top_p,
-                stop=body.stop,
-                presence_penalty=body.presence_penalty,
-                frequency_penalty=body.frequency_penalty,
-                seed=body.seed,
-                logprobs=body.logprobs,
-                top_logprobs=body.top_logprobs,
-                response_format=upstream_rf,
-                trace_id=trace.trace_id,
-            )
-        except UpstreamError as exc:
-            if exc.http_status == 400 and upstream_rf is not None:
-                # 上游不支持当前 response_format（如供应商能力变更/降级仍 400）：
-                # 去掉 response_format 后重试一次（降级容错兜底）。
-                # ★ 修复：原 messages 可能不含 JSON 相关词汇，需额外注入提示词确保
-                #   无 response_format 的上游仍能输出合法 JSON（否则 validator 报
-                #   "invalid_json" 导致整个结构化输出请求失败）。
-                retry_msgs = _upstream_messages(messages, {"type": "json_object"}, schema)
-                logger.warning(
-                    "Upstream 400 with response_format, retrying without it + json hint (provider=%s)",
-                    candidate.provider,
-                )
-                ctx.metrics.inc_upstream_attempt()
-                result = await adapter.chat_complete(
-                    retry_msgs,
-                    candidate.upstream_model,
-                    temperature=body.temperature,
-                    max_tokens=body.max_tokens,
-                    top_p=body.top_p,
-                    stop=body.stop,
-                    presence_penalty=body.presence_penalty,
-                    frequency_penalty=body.frequency_penalty,
-                    seed=body.seed,
-                    logprobs=body.logprobs,
-                    top_logprobs=body.top_logprobs,
-                    response_format=None,
-                    trace_id=trace.trace_id,
-                )
-            else:
-                raise
+        upstream_rf = (
+            None if rf_degraded
+            else _upstream_response_format(body, capability)
+        )
+        upstream_msgs = _upstream_messages(
+            messages,
+            {"type": "json_object"} if rf_degraded else upstream_rf,
+            schema,
+        )
+        ctx.metrics.inc_upstream_attempt()
+        result = await adapter.chat_complete(
+            upstream_msgs,
+            candidate.upstream_model,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+            top_p=body.top_p,
+            stop=body.stop,
+            presence_penalty=body.presence_penalty,
+            frequency_penalty=body.frequency_penalty,
+            seed=body.seed,
+            logprobs=body.logprobs,
+            top_logprobs=body.top_logprobs,
+            response_format=upstream_rf,
+            trace_id=trace.trace_id,
+        )
         # 结构化输出校验 + 自动修复（无效则触发重试/fallback）
         if schema is not None:
             _data, err = ctx.validator.validate_response(result.content, schema)
@@ -350,10 +325,16 @@ async def _handle_completion(
 
     try:
         outcome = await ctx.retry.execute(
-            ctx.store, candidates, call_one, on_attempt_failure=on_attempt_failure
+            ctx.store, candidates, call_one,
+            on_attempt_failure=on_attempt_failure,
+            rf_available=body.response_format is not None,
         )
     except GatewayError as exc:
-        await _record_failure(ctx, trace, exc, messages)
+        await _record_failure(
+            ctx, trace, exc, messages,
+            provider=getattr(exc, "provider", ""),
+            model=getattr(exc, "model", ""),
+        )
         raise
 
     elapsed_ms = (time.monotonic() - t_start) * 1000.0
@@ -509,7 +490,6 @@ async def _handle_stream(
     t_start = time.monotonic()
 
     async def event_stream() -> AsyncIterator[str]:
-        stream_started = False
         last_error: Optional[GatewayError] = None
         attempts_total = 0
         success_provider: Optional[str] = None
@@ -517,207 +497,132 @@ async def _handle_stream(
         final_usage = None
         ttft: Optional[float] = None
         stream_chars = 0  # 已向客户端输出的字符数（半程观测）
-        content_parts: list[str] = []  # 累积 delta 内容（仅结构化输出流式收尾校验用；schema=None 不累积）
+        content_parts: list[str] = []  # 累积 delta 内容（仅结构化输出收尾校验用）
         partial_recorded = False  # 是否已固化"部分输出后失败"观测
-        abort_candidate = False  # 是否应中止当前候选（失败=不再重试，转下一候选）
+        partial_attempts = 0
+        partial_providers: list[str] = []
+        last_error_provider = ""
+        last_error_model = ""
 
         # 方案B：注册客户端断连的主动轮询信号（兜底），与上游流任务共享取消信号，
         # 阻塞上游读取期间也能及时感知断连。正常终/取消时在 finally 注销，防 task 泄漏。
         signal = await ctx.cancellation.register_signal(trace.trace_id, request)
+
+        async def open_stream(candidate, attempt: int, rf_degraded: bool):
+            """构造上游流；是否降级 response_format 由状态机决策，本函数只按标记改写请求。"""
+            adapter = get_adapter(cfg.providers[candidate.provider], ctx.http_pool)
+            capability = cfg.providers[candidate.provider].structured_output
+            upstream_rf = (
+                None if rf_degraded
+                else _upstream_response_format(body, capability)
+            )
+            upstream_msgs = _upstream_messages(
+                messages,
+                {"type": "json_object"} if rf_degraded else upstream_rf,
+                schema,
+            )
+            ctx.metrics.inc_upstream_attempt()
+            return adapter.stream_chat(
+                upstream_msgs,
+                candidate.upstream_model,
+                temperature=body.temperature,
+                max_tokens=body.max_tokens,
+                top_p=body.top_p,
+                stop=body.stop,
+                presence_penalty=body.presence_penalty,
+                frequency_penalty=body.frequency_penalty,
+                seed=body.seed,
+                response_format=upstream_rf,
+                trace_id=trace.trace_id,
+            )
+
+        async def read_event(agen):
+            """取下一个上游事件；与客户端断连信号竞争（主动轮询兜底）。"""
+            if signal.cancelled:
+                raise ClientDisconnected()
+            ev, disconnected = await _anext_or_disconnect(agen, signal)
+            if disconnected:
+                raise ClientDisconnected()
+            return ev
+
+        async def on_attempt_failure(candidate, err):
+            await _record_unbilled_cost(
+                ctx, trace, err, messages, candidate.provider, candidate.model_name
+            )
+
+        async def on_partial_failure(candidate, err, attempt: int, attempt_chars: int):
+            nonlocal partial_recorded, partial_attempts
+            await ctx.store.record_stream_attempt_failure(
+                billing_id=trace.billing_id,
+                trace_id=trace.trace_id,
+                provider=candidate.provider,
+                model=candidate.model_name,
+                attempt=attempt,
+                stream_chars=attempt_chars,
+                error_code=err.code,
+            )
+            partial_recorded = True
+            partial_attempts += 1
+            partial_providers.append(f"{candidate.provider}/{candidate.model_name}")
+
+        async def on_cancel(candidate, attempt_chars: int, attempt_started: bool):
+            await _record_cancelled_trace(
+                ctx, trace, candidate.provider, candidate.model_name,
+                attempt_chars, attempt_started,
+            )
+
         try:
-            for ci, candidate in enumerate(candidates):
-                # 候选级 TTFT 锚定：每次切换候选重置，避免上一失败候选的首 token TTFT
-                # 污染成功候选的归因（#4 修复）。
-                candidate_first_token = True
-                ttft = None
-                content_parts = []  # 候选级重置：失败候选残留内容不得污染成功候选的收尾校验
-                decision = await ctx.circuit.can_pass_request(ctx.store, candidate.provider)
-                if not decision.allowed:
-                    continue
-                adapter = get_adapter(cfg.providers[candidate.provider], ctx.http_pool)
-                # 能力门控：按 provider 能力降级 response_format + 补充 json 提示词
-                capability = cfg.providers[candidate.provider].structured_output
-                upstream_rf = _upstream_response_format(body, capability)
-                upstream_msgs = _upstream_messages(messages, upstream_rf, schema)
-                rf_degraded = False  # 是否已"去掉 response_format"重试一次（降级容错兜底）
+            async for item in ctx.retry.stream(
+                ctx.store,
+                candidates,
+                open_stream,
+                rf_available=body.response_format is not None,
+                read_event=read_event,
+                is_cancelled=lambda: signal.cancelled,
+                on_attempt_failure=on_attempt_failure,
+                on_partial_failure=on_partial_failure,
+                on_cancel=on_cancel,
+            ):
+                if item.kind == "delta":
+                    ev = item.event
+                    candidate = item.candidate
+                    if ev.delta:
+                        stream_chars += len(str(ev.delta))
+                        if schema is not None:
+                            content_parts.append(str(ev.delta))
+                    chunk: dict[str, Any] = {
+                        "id": _completion_id(trace.trace_id),
+                        "object": "chat.completion.chunk",
+                        "created": int(trace.timestamp_us),
+                        "model": candidate.model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ev.delta} if ev.delta else {},
+                            "finish_reason": ev.finish_reason,
+                        }],
+                    }
+                    yield _sse(chunk)
 
-                for attempt in range(1, ctx.retry.policy.max_attempts + 1):
-                    attempts_total += 1
-                    # ★ 每次尝试（含同候选重试）重置首 token 锚点：
-                    #   上一尝试输出首 token 后失败，重试时会继续保留旧 ttft，
-                    #   导致 TTFT 归因到失败的尝试而非本次成功候选（同候选内跨尝试 bug）。
-                    candidate_first_token = True
-                    ctx.metrics.inc_upstream_attempt()
-                    agen = adapter.stream_chat(
-                        upstream_msgs,
-                        candidate.upstream_model,
-                        temperature=body.temperature,
-                        max_tokens=body.max_tokens,
-                        top_p=body.top_p,
-                        stop=body.stop,
-                        presence_penalty=body.presence_penalty,
-                        frequency_penalty=body.frequency_penalty,
-                        seed=body.seed,
-                        response_format=upstream_rf,
-                        trace_id=trace.trace_id,
-                    )
-                    try:
-                        while True:
-                            # 主动轮询兜底：断连信号已触发则立即停止阻塞上游读取
-                            if signal.cancelled:
-                                await agen.aclose()
-                                await _record_cancelled_trace(
-                                    ctx, trace, candidate.provider, candidate.model_name,
-                                    stream_chars, stream_started,
-                                )
-                                raise asyncio.CancelledError
-                            ev, disconnected = await _anext_or_disconnect(agen, signal)
-                            if disconnected:
-                                await agen.aclose()
-                                await _record_cancelled_trace(
-                                    ctx, trace, candidate.provider, candidate.model_name,
-                                    stream_chars, stream_started,
-                                )
-                                raise asyncio.CancelledError
-                            if ev.usage is not None:
-                                final_usage = ev.usage
-                                success_provider, success_model = candidate.provider, candidate.model_name
-                                if ttft is None:
-                                    ttft = ev.ttft_ms
-                                break
-                            if ev.delta or ev.finish_reason:
-                                if candidate_first_token and ev.ttft_ms is not None:
-                                    ttft = ev.ttft_ms
-                                candidate_first_token = False
-                                stream_started = True
-                                if ev.delta:
-                                    stream_chars += len(str(ev.delta))
-                                    if schema is not None:
-                                        content_parts.append(str(ev.delta))
-                                chunk: dict[str, Any] = {
-                                    "id": _completion_id(trace.trace_id),
-                                    "object": "chat.completion.chunk",
-                                    "created": int(trace.timestamp_us),
-                                    "model": candidate.model_name,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": ev.delta} if ev.delta else {},
-                                        "finish_reason": ev.finish_reason,
-                                    }],
-                                }
-                                yield _sse(chunk)
-                            # 不提前 break：继续消费直到 usage 汇总事件（保证计费真实）
-                    except StopAsyncIteration:
-                        # 流正常结束但无 usage 事件：标记为不完整 + 估算（而非默认真实完整）
-                        from ..adapters.base import Usage as _Usage
-                        final_usage = _Usage(prompt_tokens=0, completion_tokens=0, complete=False, estimated=True)
-                        await ctx.circuit.record_success(ctx.store, candidate.provider)
-                        success_provider, success_model = candidate.provider, candidate.model_name
-                    except asyncio.CancelledError:
-                        await agen.aclose()
-                        # 半程取消观测固化：客户端中途断开/取消仍留痕
-                        await _record_cancelled_trace(
-                            ctx, trace, candidate.provider, candidate.model_name,
-                            stream_chars, stream_started,
-                        )
-                        raise
-                    except GatewayError as exc:
-                        await agen.aclose()
-                        last_error = exc
-                        if getattr(exc, "config_missing", False):
-                            # 配置缺失（Key 未设置）：不重试、不计熔断，跳下一候选
-                            #（与 retry_fallback.execute 语义一致，避免误开熔断）
-                            last_error = UpstreamError(
-                                f"Upstream authentication failed ({candidate.provider})",
-                                http_status=502,
-                            )
-                            logger.warning(
-                                "Skip candidate %s (missing api key)", candidate.provider
-                            )
-                            break
-                        if stream_started:
-                            # 首 token 后断流：先固化"部分输出后失败"的半程观测，
-                            # 再尝试后续候选/重试（区别于 cancel，语义为 partial_failed）。
-                            # ★ 部分失败同样计入熔断：避免"能吐字但总中途失败"的
-                            #   半死不活 provider 永远不被降级、持续制造 partial_failed。
-                            await _record_partial_failure_trace(
-                                ctx, trace, candidate.provider, candidate.model_name,
-                                stream_chars, True, exc,
-                            )
-                            # 观察模式：已吐字（上游已计费）后失败，记录可能产生的花费
-                            await _record_unbilled_cost(
-                                ctx, trace, exc, messages,
-                                candidate.provider, candidate.model_name,
-                            )
-                            partial_recorded = True
-                            await ctx.circuit.record_failure(ctx.store, candidate.provider)
-                            abort_candidate = True
-                            break
-                        if ctx.retry.is_retryable(exc) and attempt < ctx.retry.policy.max_attempts:
-                            # 与 RetryPolicy 保持一致（指数+抖动），而非线性退避
-                            await asyncio.sleep(ctx.retry.policy.backoff_for(attempt))
-                            continue
-                        if (
-                            isinstance(exc, UpstreamError)
-                            and exc.http_status == 400
-                            and upstream_rf is not None
-                            and not rf_degraded
-                        ):
-                            # 上游不支持当前 response_format（能力降级仍 400）：
-                            # 去掉 response_format 后重试一次（降级容错兜底）。
-                            # ★ 与 _handle_completion 一致：重试时注入 JSON 提示词，
-                            #   否则无 response_format 的上游可能输出纯文本，validator
-                            #   解析失败导致整个结构化输出请求失败。
-                            logger.warning(
-                                "Upstream 400 with response_format, retrying without it + json hint (provider=%s)",
-                                candidate.provider,
-                            )
-                            upstream_rf = None
-                            upstream_msgs = _upstream_messages(messages, {"type": "json_object"}, schema)
-                            rf_degraded = True
-                            continue
-                        await ctx.circuit.record_failure(ctx.store, candidate.provider)
-                        abort_candidate = True
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        await agen.aclose()
-                        # 兼容 Starlette/anyio 把取消包装为异常组（BaseExceptionGroup）
-                        if isinstance(exc, BaseExceptionGroup) and _is_cancellation(exc):
-                            await _record_cancelled_trace(
-                                ctx, trace, candidate.provider, candidate.model_name,
-                                stream_chars, stream_started,
-                            )
-                            raise exc  # noqa: TRY201 - 保留取消语义
-                        last_error = UpstreamError(str(exc))
-                        if stream_started:
-                            # 已吐字后断流（如 httpx 连接中断/上游异常）：固化半程观测，
-                            # 并计入熔断失败（半死不活的上游不应长期豁免降级）
-                            await _record_partial_failure_trace(
-                                ctx, trace, candidate.provider, candidate.model_name,
-                                stream_chars, True, last_error,
-                            )
-                            await _record_unbilled_cost(
-                                ctx, trace, last_error, messages,
-                                candidate.provider, candidate.model_name,
-                            )
-                            partial_recorded = True
-                            await ctx.circuit.record_failure(ctx.store, candidate.provider)
-                            abort_candidate = True
-                        break
+                elif item.kind == "partial_failed":
+                    partial_recorded = True
 
-                    if final_usage is not None or success_provider is not None or abort_candidate:
-                        break
-
-                # ★ 缺陷A 修复：流式成功（收到 usage / 流正常结束）后整体跳出候选循环，
-                #   不再向后续 fallback 候选发起流式请求——否则客户端会收到多 provider
-                #   拼接的输出，且 usage/TTFT 归因被后续候选覆盖。仅 abort_candidate
-                #   （失败）时继续尝试下一候选。
-                if success_provider is not None:
-                    break
+                elif item.kind == "finished":
+                    outcome = item.outcome
+                    if outcome is None:
+                        continue
+                    attempts_total = outcome.attempts
+                    if outcome.success:
+                        success_provider = outcome.provider
+                        success_model = outcome.model
+                        final_usage = outcome.usage
+                        ttft = outcome.ttft_ms
+                    else:
+                        last_error = outcome.error
+                        last_error_provider = outcome.provider
+                        last_error_model = outcome.model
 
             # ── 汇总 ─────────────────────────────────────────────
             if success_provider is not None and final_usage is not None:
-                await ctx.circuit.record_success(ctx.store, success_provider)
                 provider_cfg = cfg.providers[success_provider]
                 cost_prompt, cost_completion = provider_cfg.resolve_effective_costs()
                 cost_usd = (
@@ -760,6 +665,10 @@ async def _handle_stream(
                     .update_metric("cost_usd", cost_usd) \
                     .update_metric("status", "success") \
                     .update_metric("attempts", attempts_total)
+                if partial_recorded:
+                    trace.update_metric("partial", True) \
+                         .update_metric("partial_attempts", partial_attempts) \
+                         .update_metric("partial_providers", partial_providers)
 
                 # ★ 流式结构化输出收尾校验：usage 汇总事件后对拼接内容做 validator 校验。
                 #   非流式路径在返回前校验+自动修复；流式内容已逐块透传客户端、无法自动修复，
@@ -795,7 +704,18 @@ async def _handle_stream(
 
             # ── 失败 ─────────────────────────────────────────────
             err = last_error or UpstreamError("All upstream candidates failed")
-            await _record_failure(ctx, trace, err, messages, already_partial=partial_recorded)
+            if partial_recorded:
+                trace.update_metric("partial", True) \
+                     .update_metric("stream_started", True) \
+                     .update_metric("stream_chars", stream_chars) \
+                     .update_metric("partial_attempts", partial_attempts) \
+                     .update_metric("partial_providers", partial_providers)
+            await _record_failure(
+                ctx, trace, err, messages,
+                already_partial=partial_recorded,
+                provider=last_error_provider,
+                model=last_error_model,
+            )
             yield _error_event(err)
         finally:
             # 注销断连监听任务，防止 background task 泄漏
@@ -919,16 +839,6 @@ def _upstream_messages(
     return [*messages, {"role": "system", "content": hint}]
 
 
-def _is_cancellation(exc: BaseException) -> bool:
-    """识别"请求被客户端取消/断连"。兼容纯 CancelledError 与 Starlette/anyio
-    结构化并发下被包装为 BaseExceptionGroup 的取消异常。"""
-    if isinstance(exc, asyncio.CancelledError):
-        return True
-    if isinstance(exc, BaseExceptionGroup):
-        return any(_is_cancellation(e) for e in exc.exceptions)
-    return False
-
-
 async def _anext_or_disconnect(agen, signal) -> tuple[Optional[Any], bool]:
     """取下一个上游事件，与断连信号竞争（主动轮询兜底，方案B）。
 
@@ -978,43 +888,34 @@ async def _record_cancelled_trace(
     await ctx.store.record_trace(trace.snapshot())
 
 
-async def _record_partial_failure_trace(
-    ctx: AppContext,
-    trace: TraceFreezeRecord,
-    provider: str,
-    model: str,
-    stream_chars: int,
-    stream_started: bool,
-    err: GatewayError,
-) -> None:
-    """部分输出后失败（先吐字再断流）的半程观测固化：落 status=partial_failed。
-
-    与取消（cancelled，无 error_code）不同：该场景确实失败、携带 error_code，
-    但已向客户端吐出部分内容，需保留半程指标（partial / stream_chars）。
-    此路径无 usage 汇总事件 → 不计费，无需额外计费处理。
-    """
-    trace.update_metric("status", "partial_failed") \
-         .update_metric("partial", True) \
-         .update_metric("provider", provider) \
-         .update_metric("model", model) \
-         .update_metric("stream_chars", stream_chars) \
-         .update_metric("stream_started", stream_started) \
-         .update_metric("error_code", err.code)
-    await ctx.store.record_trace(trace.snapshot())
-
-
 async def _record_failure(
     ctx: AppContext, trace: TraceFreezeRecord, err: GatewayError, messages: list[dict[str, Any]],
     already_partial: bool = False,
+    provider: str = "",
+    model: str = "",
 ) -> None:
+    """请求终态失败落库（trace 只写一次）。
+
+    partial_failed：已向客户端下发部分内容后终止；
+    error：未下发内容即失败。
+    """
+    status = "partial_failed" if already_partial else "error"
+    trace.update_metric("status", status).update_metric("error_code", err.code)
     if already_partial:
-        # 半程已固化 partial_failed 观测：不再用 error 覆盖（避免丢失"先吐后失败"信息），
-        # 仅补充错误明细
-        await ctx.store.record_error(trace.trace_id, "", err.code, err.message)
-        return
-    trace.update_metric("status", "error").update_metric("error_code", err.code)
+        trace.update_metric("partial", True)
+    if provider:
+        trace.update_metric("provider", provider)
+    if model:
+        trace.update_metric("model", model)
     await ctx.store.record_trace(trace.snapshot())
-    await ctx.store.record_error(trace.trace_id, "", err.code, err.message)
+    await ctx.store.record_error(
+        trace.trace_id, provider, err.code, err.message, model=model
+    )
+    if provider:
+        try:
+            await ctx.store.record_daily_error(provider, model)
+        except Exception as exc:  # noqa: BLE001 - 观测失败不得覆盖原始错误响应
+            logger.warning("Failed to record daily error: %s", exc)
 
 
 # 上游明确拒绝的状态码：通常不产生费用，记入观察表会高估漏算规模。

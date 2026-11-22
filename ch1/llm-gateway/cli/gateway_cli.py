@@ -3,8 +3,9 @@ gateway-cli — SQLite 指标/追踪/模板查询工具（SPEC §13 / M5）。
 
 用法示例：
     python -m cli.gateway_cli summary
-    python -m cli.gateway_cli traces --limit 10 --status error
-    python -m cli.gateway_cli daily --days 7 --provider deepseek
+    python -m cli.gateway_cli summary --group-by provider_model --days 30
+    python -m cli.gateway_cli traces --limit 10 --status error --provider deepseek --model deepseek-chat
+    python -m cli.gateway_cli daily --days 7 --provider deepseek --model deepseek-chat
     python -m cli.gateway_cli circuit
     python -m cli.gateway_cli templates upsert --id demo --name Demo --content "你是助手，请回答：{{ question }}"
     python -m cli.gateway_cli templates list
@@ -34,16 +35,47 @@ async def _summary(args) -> None:
     store = _store(args)
     await store.initialize()
     try:
-        s = await store.query_summary()
-        print(f"requests           {s.get('requests') or 0}")
-        print(f"prompt_tokens      {s.get('prompt_tokens') or 0}")
-        print(f"completion_tokens  {s.get('completion_tokens') or 0}")
-        print(f"total_tokens       {s.get('total_tokens') or 0}")
-        print(f"total_cost         ${s.get('total_cost') or 0.0:.4f}")
-        print(f"avg_latency_ms     {s.get('avg_latency_ms') or 0.0:.1f}")
-        print(f"avg_ttft_ms        {s.get('avg_ttft_ms') or 0.0:.1f}")
-        print(f"providers          {s.get('providers') or 0}")
-        print(f"errors             {s.get('errors') or 0}")
+        result = await store.query_summary(
+            group_by=getattr(args, "group_by", None),
+            days=getattr(args, "days", 0),
+        )
+        if result.get("group_by") is None:
+            print(f"days               {result.get('days') or 0}")
+            print(f"requests           {result.get('requests') or 0}")
+            print(f"total_requests     {result.get('total_requests') or 0}")
+            print(f"errors             {result.get('errors') or 0}")
+            print(f"error_rate         {result.get('error_rate') or 0.0:.4f}")
+            print(f"prompt_tokens      {result.get('prompt_tokens') or 0}")
+            print(f"completion_tokens  {result.get('completion_tokens') or 0}")
+            print(f"total_tokens       {result.get('total_tokens') or 0}")
+            print(f"total_cost         ${result.get('total_cost') or 0.0:.4f}")
+            print(f"avg_latency_ms     {result.get('avg_latency_ms') or 0.0:.1f}")
+            print(f"avg_ttft_ms        {result.get('avg_ttft_ms') or 0.0:.1f}")
+            print(f"providers          {result.get('providers') or 0}")
+            return
+
+        print(f"group_by={result['group_by']} days={result['days']}")
+        print(
+            f"{'provider':<14} {'model':<20} {'req':>6} {'prompt':>10} "
+            f"{'completion':>10} {'tokens':>10} {'cost':>10} {'errors':>7} {'avg_ms':>10}"
+        )
+        for item in result["items"]:
+            print(
+                f"{item.get('provider', '-'):<14} {item.get('model', '-'):<20} "
+                f"{item['requests']:>6} {item['prompt_tokens']:>10} "
+                f"{item['completion_tokens']:>10} {item['total_tokens']:>10} "
+                f"${item['cost_usd']:>9.4f} {item['errors']:>7} "
+                f"{item['avg_latency_ms']:>10.1f}"
+            )
+        totals = result["totals"]
+        print(
+            f"totals: requests={totals.get('requests') or 0} "
+            f"total_requests={totals.get('total_requests') or 0} "
+            f"tokens={totals.get('total_tokens') or 0} "
+            f"cost=${totals.get('total_cost') or 0.0:.4f} "
+            f"errors={totals.get('errors') or 0} "
+            f"error_rate={totals.get('error_rate') or 0.0:.4f}"
+        )
     finally:
         await store.close()
 
@@ -52,7 +84,13 @@ async def _traces(args) -> None:
     store = _store(args)
     await store.initialize()
     try:
-        rows = await store.query_recent_traces(limit=args.limit, status=args.status)
+        rows = await store.query_recent_traces(
+            limit=args.limit,
+            status=args.status,
+            provider=getattr(args, "provider", None),
+            model=getattr(args, "model", None),
+            days=getattr(args, "days", 0),
+        )
         for r in rows:
             print(json.dumps(r, ensure_ascii=False, default=str))
     finally:
@@ -63,7 +101,11 @@ async def _daily(args) -> None:
     store = _store(args)
     await store.initialize()
     try:
-        rows = await store.query_daily_aggregates(days=args.days, provider=args.provider)
+        rows = await store.query_daily_aggregates(
+            days=args.days,
+            provider=args.provider,
+            model=getattr(args, "model", None),
+        )
         if not rows:
             print("(no data)")
         for r in rows:
@@ -124,17 +166,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", help="SQLite 数据库路径（默认 data/metrics.db）")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp = sub.add_parser("summary", help="全局用量汇总")
+    sp = sub.add_parser("summary", help="用量汇总（可选按 provider/model 分组）")
+    sp.add_argument(
+        "--group-by",
+        choices=["provider", "model", "provider_model"],
+        default=None,
+        help="按 provider/model 维度分组；不传则输出全局汇总",
+    )
+    sp.add_argument("--days", type=int, default=0, help="回溯天数，0 表示全量")
     sp.set_defaults(func=_summary)
 
     sp = sub.add_parser("traces", help="最近追踪记录")
     sp.add_argument("--limit", type=int, default=20)
-    sp.add_argument("--status", choices=["success", "error", "cancelled"])
+    sp.add_argument(
+        "--status",
+        choices=["success", "error", "partial_failed", "cancelled"],
+    )
+    sp.add_argument("--provider")
+    sp.add_argument("--model")
+    sp.add_argument("--days", type=int, default=0, help="回溯天数，0 表示全量")
     sp.set_defaults(func=_traces)
 
     sp = sub.add_parser("daily", help="按日聚合报表")
     sp.add_argument("--days", type=int, default=7)
     sp.add_argument("--provider")
+    sp.add_argument("--model")
     sp.set_defaults(func=_daily)
 
     sp = sub.add_parser("circuit", help="熔断器状态")

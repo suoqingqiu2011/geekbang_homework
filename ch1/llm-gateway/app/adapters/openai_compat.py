@@ -273,13 +273,16 @@ class OpenAICompatAdapter(BaseAdapter):
                     completed = True
                     break
                 except UpstreamError as exc:
-                    # 仅首次尝试、尚未输出内容时的 400 视为"上游不认 stream_options"，
-                    # 去掉该参数重试；已有输出或非 400 一律原样上抛（避免重复吐字）。
+                    # 仅首次尝试、尚未输出内容、且错误信息明确指向 stream_options 时，
+                    # 才去掉该参数重试；否则交给上层状态机处理（例如 response_format
+                    # 不受支持时由 RetryFallbackManager 做 RF 降级），避免误判导致
+                    # 额外的无谓上游调用。
                     if (
                         exc.http_status == 400
                         and attempt == 0
                         and not emitted
                         and fallback_body is not None
+                        and "stream_options" in str(getattr(exc, "message", exc)).lower()
                     ):
                         logger.warning(
                             "Upstream rejected stream_options (provider=%s), "

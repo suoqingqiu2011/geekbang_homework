@@ -1,0 +1,48 @@
+name: llm-gateway-tests
+
+on:
+  push:
+    paths:
+      - "ch1/llm-gateway/**"
+      - ".github/workflows/llm-gateway-tests.yml"
+  pull_request:
+    paths:
+      - "ch1/llm-gateway/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-gateway-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ch1/llm-gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ch1/llm-gateway/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: python -m pytest tests -q --junitxml=pytest.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-gateway-pytest
+          path: ch1/llm-gateway/pytest.xml

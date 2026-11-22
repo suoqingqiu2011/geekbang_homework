@@ -53,12 +53,12 @@ def test_backoff_invalid_attempt_returns_zero():
 
 
 # ─────────────────────────────────────────────────────────────
-# 流式重试：退避参数必须来自 RetryPolicy（execute_stream 复用 execute）
+# 流式重试：退避参数必须来自 RetryPolicy（execute 复用 execute）
 # ─────────────────────────────────────────────────────────────
-async def test_execute_stream_backoff_matches_retry_policy(gateway, monkeypatch):
+async def test_execute_backoff_matches_retry_policy(gateway, monkeypatch):
     """流式路径的退避必须完全按 RetryPolicy 计算。
 
-    流式走 execute_stream（复用 execute）。注入必然抛可重试 500 的 callable，
+    流式走 execute（复用 execute）。注入必然抛可重试 500 的 callable，
     jitter=0 使 backoff_for 值确定，断言相邻重试间的 sleep 参数 == backoff_for(attempt)，
     即"指数退避"而非旧的线性 0.5*attempt。_handle_stream 的手写重试亦调用同一
     backoff_for，构成单一事实来源。
@@ -82,12 +82,12 @@ async def test_execute_stream_backoff_matches_retry_policy(gateway, monkeypatch)
 
     calls = {"n": 0}
 
-    async def call_one(candidate, probe=False, attempt=1) -> object:  # noqa: ARG001,RUF100
+    async def call_one(candidate, attempt=1, rf_degraded=False) -> object:  # noqa: ARG001,RUF100
         calls["n"] += 1
         raise UpstreamError("boom", http_status=500)  # 可重试错误，耗尽全部尝试
 
     with pytest.raises(UpstreamError):
-        await mgr.execute_stream(gateway["ctx"].store, [_Cand()], call_one)
+        await mgr.execute(gateway["ctx"].store, [_Cand()], call_one)
 
     assert calls["n"] == policy.max_attempts  # 3 次全部尝试
     # attempt1 → 0.01、attempt2 → 0.02（指数）；绝非旧的线性 0.5*attempt(0.5/1.0)
@@ -105,7 +105,7 @@ async def test_attempt_failure_hook_error_does_not_break_retry(gateway):
 
     seen = {"call": 0, "hook": 0}
 
-    async def call_one(candidate, probe=False, attempt=1) -> object:  # noqa: ARG001,RUF100
+    async def call_one(candidate, attempt=1, rf_degraded=False) -> object:  # noqa: ARG001,RUF100
         seen["call"] += 1
         raise UpstreamError("boom", http_status=502)
 
@@ -136,7 +136,7 @@ async def test_execute_config_missing_skips_retry_and_circuit(gateway):
 
     calls = {"n": 0}
 
-    async def call_one(candidate, probe=False, attempt=1) -> object:  # noqa: ARG001
+    async def call_one(candidate, attempt=1, rf_degraded=False) -> object:  # noqa: ARG001
         calls["n"] += 1
         raise InvalidAuthError("api key not configured", config_missing=True)
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from fastapi import APIRouter, Query, Request
 
@@ -28,22 +29,46 @@ async def _authorize(request: Request) -> AppContext:
 
 
 @router.get("/summary")
-async def summary(request: Request) -> dict:
-    """累计用量概览（请求数 / token / 成本 / 平均时延 / 错误数）。"""
+async def summary(
+    request: Request,
+    group_by: Literal["provider", "model", "provider_model"] | None = Query(
+        None, description="按 provider/model 维度分组；不传则返回全局聚合"
+    ),
+    days: int = Query(0, ge=0, le=365, description="回溯天数，0 表示全量"),
+) -> dict:
+    """累计用量概览（请求数 / token / 成本 / 平均时延 / 错误数）。
+
+    传 group_by 时返回 {group_by, days, totals, items}，items 为分组明细；
+    不传时保持原扁平结构，向后兼容 CLI/看板。
+    """
     ctx = await _authorize(request)
-    return await ctx.store.query_summary()
+    return await ctx.store.query_summary(group_by=group_by, days=days)
 
 
 @router.get("/traces")
 async def traces(
     request: Request,
     limit: int = Query(20, ge=1, le=MAX_LIMIT, description="返回条数上限"),
-    status: str | None = Query(None, description="按状态过滤：success/error/cancelled"),
+    status: str | None = Query(
+        None, description="按状态过滤：success/error/partial_failed/cancelled"
+    ),
+    provider: str | None = Query(None, description="按供应商过滤"),
+    model: str | None = Query(None, description="按模型过滤"),
+    days: int = Query(0, ge=0, le=365, description="回溯天数，0 表示全量"),
 ) -> dict:
     """最近请求追踪记录（不含 prompt/response 原文）。"""
     ctx = await _authorize(request)
-    items = await ctx.store.query_recent_traces(limit=limit, status=status)
-    return {"limit": limit, "status": status, "items": items}
+    items = await ctx.store.query_recent_traces(
+        limit=limit, status=status, provider=provider, model=model, days=days
+    )
+    return {
+        "limit": limit,
+        "status": status,
+        "provider": provider,
+        "model": model,
+        "days": days,
+        "items": items,
+    }
 
 
 @router.get("/daily")
@@ -51,8 +76,16 @@ async def daily(
     request: Request,
     days: int = Query(7, ge=1, le=90, description="回溯天数"),
     provider: str | None = Query(None, description="按供应商过滤"),
+    model: str | None = Query(None, description="按模型过滤"),
 ) -> dict:
     """按天聚合的用量与成本。"""
     ctx = await _authorize(request)
-    items = await ctx.store.query_daily_aggregates(days=days, provider=provider)
-    return {"days": days, "provider": provider, "items": items}
+    items = await ctx.store.query_daily_aggregates(
+        days=days, provider=provider, model=model
+    )
+    return {
+        "days": days,
+        "provider": provider,
+        "model": model,
+        "items": items,
+    }

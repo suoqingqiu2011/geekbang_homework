@@ -1,16 +1,10 @@
-"""TTFT 候选切换归因测试（对应"双协议、流观测、韧性主流程"的候选链观测修复）。
+"""TTFT 候选切换归因与首字节后终止测试。
 
-问题根因：_handle_stream 中 `stream_started`/`ttft` 跨越候选链共享。当候选1在
-首个 token 后失败（或完全失败）再切换候选2，候选2的 TTFT 会被旧候选的
-`stream_started=True` 屏蔽，导致 usage 记录的 ttft_ms 归属到失败的候选1，
-而非真正成功输出内容的候选2 —— 归因错乱。
-
-修复：引入候选级 `candidate_first_token` 并在每次进入候选时重置，TTFT 只记录
-"最终成功候选"的首 token 延迟。
-
-本文件采用与 test_stream_cancel/partial 一致的单元级驱动：构造多候选链并直接
-迭代 `_handle_stream` 返回的 StreamingResponse.body_iterator，全程走真实
-upstream 流（httpx pool）与落库，断言 usage_metrics.ttft_ms 归属成功候选。
+覆盖：
+  1) D1：首 token 后失败 → 终止，不 fallback 拼接后续候选；
+  2) 候选完全失败（未吐字）→ fallback，TTFT 归属最终成功候选；
+  3) 单候选正常流，TTFT 正常记录；
+  4) 首个成功候选后立即停止，不串流后续候选。
 """
 
 from __future__ import annotations
@@ -44,7 +38,7 @@ def _body(trace_id: str) -> ChatCompletionRequest:
 
 
 def _candidates(first_upstream: str) -> list[Candidate]:
-    """候选链：候选1 行为由 first_upstream 决定（失败），候选2 固定为 slowstart（成功，TTFT≈300ms）。"""
+    """候选链：候选1 行为由 first_upstream 决定，候选2 固定为 slowstart（成功，TTFT≈300ms）。"""
     return [
         Candidate(
             model_name="first", provider="ok", upstream_model=first_upstream,
@@ -80,24 +74,80 @@ async def _usage_ttft(ctx, trace_id: str) -> tuple[str, str, float]:
     return row["provider"], row["model"], row["ttft_ms"]
 
 
-# ─────────────────────────────────────────────────────────────
-# 场景1：候选1 吐字后断流（partial_failed）→ 候选2 成功
-# TTFT 应归属成功候选 slowstart（≈300ms），而非候选1 broken（≈0ms）
-# ─────────────────────────────────────────────────────────────
-async def test_ttft_attributed_to_successful_after_partial_failure(gateway):
-    ctx = gateway["ctx"]
-    trace_id = "ttft-partial"
-    await _run(ctx, trace_id, first_upstream="broken")
+async def _trace_runtime(ctx, trace_id: str) -> dict:
+    row = await (
+        await ctx.store._require_db().execute(
+            "SELECT payload FROM traces WHERE trace_id = ?", (trace_id,)
+        )
+    ).fetchone()
+    assert row is not None, f"trace {trace_id} not found"
+    return json.loads(row["payload"])
 
-    provider, model, ttft_ms = await _usage_ttft(ctx, trace_id)
-    assert provider == "ok"
-    assert model == "slowstart"          # 计费/归因给成功候选2
-    assert ttft_ms >= 250                # ≈300ms 的首 token 延迟（归因成功候选2）
+
+def _streamed_models(chunks: list[str]) -> set[str]:
+    models: set[str] = set()
+    for chunk in chunks:
+        if chunk.startswith("data: [DONE]"):
+            continue
+        try:
+            payload = json.loads(chunk[len("data: "):].strip())
+        except (ValueError, KeyError):
+            continue
+        choices = payload.get("choices") or [{}]
+        if (choices[0].get("delta") or {}).get("content"):
+            models.add(payload.get("model"))
+    return models
+
+
+# ─────────────────────────────────────────────────────────────
+# 场景1（D1）：候选1 吐字后断流 → 终止，不得 fallback 拼接候选2
+# ─────────────────────────────────────────────────────────────
+async def test_no_fallback_after_partial_and_trace_partial_failed(gateway):
+    ctx = gateway["ctx"]
+    trace_id = "partial-abort"
+    chunks = await _run(ctx, trace_id, first_upstream="broken")
+
+    live = [c for c in chunks if c.startswith("data: ") and not c.startswith("data: [DONE]")]
+    text = "".join(chunks)
+    assert "Hello" in text                 # 候选1 已吐出的内容
+    assert "world" not in text             # 候选2 未被调用，不得拼接
+    assert _streamed_models(chunks) == {"first"}
+    assert any('"error"' in c for c in live)
+
+    runtime = await _trace_runtime(ctx, trace_id)
+    assert runtime["status"] == "partial_failed"
+    assert runtime["partial"] is True
+    assert runtime["provider"] == "ok"
+    assert runtime["model"] == "first"
+    assert runtime["stream_chars"] > 0
+    assert runtime["error_code"]
+
+    # 已下发部分内容后终止：不产生 usage / 计费行
+    db = ctx.store._require_db()
+    usage = await (
+        await db.execute(
+            "SELECT 1 FROM usage_metrics WHERE trace_id = ?", (trace_id,)
+        )
+    ).fetchone()
+    assert usage is None
+
+    # partial 观测写独立表
+    obs = await (
+        await db.execute(
+            "SELECT provider, model, error_code FROM stream_attempt_failures "
+            "WHERE trace_id = ?",
+            (trace_id,),
+        )
+    ).fetchone()
+    assert obs is not None
+    assert obs["provider"] == "ok"
+    assert obs["model"] == "first"
+    assert obs["error_code"]
 
 
 # ─────────────────────────────────────────────────────────────
 # 场景2：候选1 完全失败（上游 5xx，未吐字）→ 候选2 成功
-# 验证切换前无吐字时，TTFT 同样归属最终成功候选
+# TTFT 应归属成功候选 slowstart
 # ─────────────────────────────────────────────────────────────
 async def test_ttft_attributed_to_successful_after_full_failure(gateway):
     ctx = gateway["ctx"]
@@ -112,7 +162,6 @@ async def test_ttft_attributed_to_successful_after_full_failure(gateway):
 
 # ─────────────────────────────────────────────────────────────
 # 场景3（基线）：无候选切换，单成功候选 TTFT 仍正常记录
-# 防止修复引入回归（候选级重置不能丢正常流的 TTFT）
 # ─────────────────────────────────────────────────────────────
 async def test_ttft_normal_flow_successful_candidate(gateway):
     ctx = gateway["ctx"]
@@ -125,19 +174,16 @@ async def test_ttft_normal_flow_successful_candidate(gateway):
     )
     chunks = [c async for c in resp.body_iterator]
     text = "".join(chunks)
-    assert "Hello" in text and "world" in text  # SSE 各 delta 分属不同事件，需拼接后断言
-    assert "data: [DONE]" in text               # 成功流完整结束
+    assert "Hello" in text and "world" in text
+    assert "data: [DONE]" in text
     _, model, ttft_ms = await _usage_ttft(ctx, trace_id)
-    # ★ 缺陷A 修复后：首个成功候选（model_name="first"）即停止，
-    #   usage 归因不再被后续候选（slowstart）覆盖。
+    # 首个成功候选（model_name="first"）即停止，usage 归因不再被后续候选覆盖
     assert model == "first"
     assert ttft_ms >= 250
 
 
 # ─────────────────────────────────────────────────────────────
-# 场景4（★ 缺陷A 回归）：多候选链中首个候选成功即停止，不得串流后续候选
-# 修复前：成功候选后的候选循环未 break，会继续向候选2/3 发起流式请求，
-# 客户端收到多 provider 拼接的输出，usage/TTFT 归因被后续候选覆盖。
+# 场景4：多候选链中首个候选成功即停止，不得串流后续候选
 # ─────────────────────────────────────────────────────────────
 async def test_stream_stops_after_first_successful_candidate(gateway):
     ctx = gateway["ctx"]
@@ -163,18 +209,8 @@ async def test_stream_stops_after_first_successful_candidate(gateway):
     )
     chunks = [c async for c in resp.body_iterator]
 
-    # 只下发首个成功候选（c1）的内容 chunk，不得出现 c2/c3 的流
-    streamed_models = set()
-    for c in chunks:
-        if c.startswith("data: [DONE]"):
-            continue
-        payload = json.loads(c[len("data: "):].strip())
-        choices = payload.get("choices") or [{}]
-        if (choices[0].get("delta") or {}).get("content"):
-            streamed_models.add(payload["model"])
-    assert streamed_models == {"c1"}, f"串流输出到非首个成功候选: {streamed_models}"
+    assert _streamed_models(chunks) == {"c1"}, "串流输出到非首个成功候选"
 
-    # usage/TTFT 归因于首个成功候选 c1（修复前会被 c3 覆盖）
     provider, model, _ = await _usage_ttft(ctx, trace_id)
     assert provider == "ok"
     assert model == "c1"

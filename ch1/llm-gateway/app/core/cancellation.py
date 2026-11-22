@@ -14,6 +14,23 @@ from typing import Optional
 logger = logging.getLogger("llm-gateway.cancellation")
 
 
+class ClientDisconnected(Exception):
+    """客户端断连（与任务取消区分，供流式状态机识别）。"""
+
+
+def is_cancellation(exc: BaseException) -> bool:
+    """识别"请求被客户端取消/断连"。
+
+    兼容纯 CancelledError 与 Starlette/anyio 结构化并发下被包装为
+    BaseExceptionGroup 的取消异常。
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(is_cancellation(e) for e in exc.exceptions)
+    return False
+
+
 class CancelSignal:
     """共享取消信号。"""
 

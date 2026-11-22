@@ -1,0 +1,25 @@
+# LLM Gateway — 测试镜像（仅用于 docker compose --profile test）
+# 构建：docker build -f docker/Dockerfile.test -t llm-gateway-test .
+# 运行：docker compose --profile test run --rm tests
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    GATEWAY_ENV=dev \
+    GATEWAY_API_KEYS=sk-test
+
+WORKDIR /srv/gateway
+
+# 依赖层缓存（含 dev/test 依赖）
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# 应用与测试代码
+COPY app ./app
+COPY cli ./cli
+COPY config ./config
+COPY tests ./tests
+COPY pytest.ini ./
+
+CMD ["python", "-m", "pytest", "tests", "-q"]

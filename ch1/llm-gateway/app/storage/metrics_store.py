@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS error_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     trace_id    TEXT,
     provider    TEXT,
+    model       TEXT DEFAULT '',
     error_code  TEXT,
     message     TEXT,
     created_at  REAL NOT NULL
@@ -118,15 +119,43 @@ CREATE TABLE IF NOT EXISTS unbilled_attempt_costs (
     created_at    REAL NOT NULL
 );
 
+-- 流式半程失败观测（append-only）：已向客户端吐字后失败的上游尝试。
+-- 与 traces 分离，避免中途写入冻结最终 trace（traces 使用 INSERT OR IGNORE），
+-- 也避免写入 error_log 虚增 summary.errors。
+CREATE TABLE IF NOT EXISTS stream_attempt_failures (
+    attempt_key   TEXT PRIMARY KEY,               -- billing_id:provider:model:attempt，防重复累加
+    billing_id    TEXT NOT NULL,
+    trace_id      TEXT NOT NULL,
+    provider      TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    attempt       INTEGER NOT NULL,
+    stream_chars  INTEGER NOT NULL,
+    error_code    TEXT NOT NULL,
+    created_at    REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_metrics (created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_metrics (provider);
+-- summary group_by=provider|model|provider_model 的覆盖索引
+CREATE INDEX IF NOT EXISTS idx_usage_provider_model ON usage_metrics (provider, model);
+CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_metrics (model);
+-- 带 days 时间窗的分组汇总：时间过滤 + provider/model 分组
+CREATE INDEX IF NOT EXISTS idx_usage_created_provider_model
+    ON usage_metrics (created_at, provider, model);
 -- 预算查询（query_spent_usd 按 project_id 求和 cost_usd）覆盖索引：
 -- 避免每个带预算请求都对 usage_metrics 全表扫描。
 CREATE INDEX IF NOT EXISTS idx_usage_project_cost ON usage_metrics (project_id, cost_usd);
 CREATE INDEX IF NOT EXISTS idx_traces_created ON traces (created_at);
+-- traces 按 provider/model 过滤 + 时间倒序
+CREATE INDEX IF NOT EXISTS idx_traces_provider_model ON traces (provider, model, created_at);
 CREATE INDEX IF NOT EXISTS idx_error_created ON error_log (created_at);
+-- summary grouped errors：按 provider / provider+model + 时间窗聚合
+CREATE INDEX IF NOT EXISTS idx_error_provider_created ON error_log (provider, created_at);
+CREATE INDEX IF NOT EXISTS idx_error_provider_model_created ON error_log (provider, model, created_at);
 CREATE INDEX IF NOT EXISTS idx_unbilled_created ON unbilled_attempt_costs (created_at);
 CREATE INDEX IF NOT EXISTS idx_unbilled_project ON unbilled_attempt_costs (project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_stream_attempt_created ON stream_attempt_failures (created_at);
+CREATE INDEX IF NOT EXISTS idx_stream_attempt_trace ON stream_attempt_failures (trace_id);
 """
 
 
@@ -152,6 +181,7 @@ class MetricsStore:
         await self._migrate_prompt_templates_if_needed()
         await self._migrate_usage_columns_if_needed()
         await self._migrate_daily_aggregates_if_needed()
+        await self._migrate_error_log_if_needed()
         await self._db.commit()
         logger.info("MetricsStore initialized: %s", self.db_path)
 
@@ -260,6 +290,27 @@ class MetricsStore:
             ),
         )
 
+    async def record_daily_error(self, provider: str, model: str) -> None:
+        """累加某 provider/model 的终态失败数（供 daily 错误率使用）。
+
+        只统计已进入 provider 候选链的失败（上游错误 / 部分输出后失败），
+        不包含限流、鉴权、参数校验等请求前置拒绝，也不包含客户端取消。
+        """
+        db = self._require_db()
+        day = time.strftime("%Y-%m-%d")
+        await db.execute(
+            """
+            INSERT INTO daily_aggregates (
+                day, provider, model, requests, errors,
+                prompt_tokens, completion_tokens, total_tokens, cost_usd, total_latency_ms
+            ) VALUES (?, ?, ?, 0, 1, 0, 0, 0, 0.0, 0.0)
+            ON CONFLICT(day, provider, model) DO UPDATE SET
+                errors = errors + 1
+            """,
+            (day, provider, model),
+        )
+        await db.commit()
+
     # ── 预算：按实际 token 用量核算累计花费 ────────────────────
     async def query_spent_usd(self, project_id: str) -> float:
         """查询某项目累计真实花费（用于预算路由的 spent_usd）。
@@ -324,6 +375,50 @@ class MetricsStore:
         await db.commit()
         return cursor.rowcount
 
+    # ── 流式半程失败观测（append-only，不影响 trace/错误率）─────
+    async def record_stream_attempt_failure(
+        self,
+        *,
+        billing_id: str,
+        trace_id: str,
+        provider: str,
+        model: str,
+        attempt: int,
+        stream_chars: int,
+        error_code: str,
+    ) -> bool:
+        """记录一次"已向客户端吐字后失败"的上游尝试。
+
+        attempt_key 幂等：同一请求的同一候选/尝试重复上报不会重复累加。
+        该表仅用于审计半程失败，不参与 error_log / summary.errors 统计。
+        """
+        db = self._require_db()
+        key = f"{billing_id}:{provider}:{model}:{attempt}"
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO stream_attempt_failures "
+            "(attempt_key, billing_id, trace_id, provider, model, attempt, "
+            " stream_chars, error_code, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                key, billing_id, trace_id, provider, model, attempt,
+                stream_chars, error_code, time.time(),
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+    async def purge_stream_attempt_failures(self, retention_days: int) -> int:
+        """删除超过保留期的流式半程失败观测数据。"""
+        if retention_days <= 0:
+            return 0
+        cutoff = time.time() - retention_days * 86400.0
+        db = self._require_db()
+        cursor = await db.execute(
+            "DELETE FROM stream_attempt_failures WHERE created_at < ?", (cutoff,)
+        )
+        await db.commit()
+        return cursor.rowcount
+
     async def summarize_unbilled_attempt_costs(self, days: int = 7) -> dict[str, Any]:
         """按天窗口汇总观察数据：总量 + 按 reason 分组（用于评估漏算规模）。"""
         db = self._require_db()
@@ -380,12 +475,14 @@ class MetricsStore:
         await db.commit()
 
     async def record_error(
-        self, trace_id: str, provider: str, error_code: str, message: str
+        self, trace_id: str, provider: str, error_code: str, message: str,
+        model: str = "",
     ) -> None:
         db = self._require_db()
         await db.execute(
-            "INSERT INTO error_log (trace_id, provider, error_code, message, created_at) VALUES (?,?,?,?,?)",
-            (trace_id, provider, error_code, message[:1000], time.time()),
+            "INSERT INTO error_log (trace_id, provider, model, error_code, message, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (trace_id, provider, model, error_code, message[:1000], time.time()),
         )
         await db.commit()
 
@@ -531,7 +628,7 @@ class MetricsStore:
 
     # ── CLI 查询（SPEC §13 / M5）──────────────────────────────
     async def query_daily_aggregates(
-        self, days: int = 7, provider: str | None = None
+        self, days: int = 7, provider: str | None = None, model: str | None = None
     ) -> list[dict[str, Any]]:
         db = self._require_db()
         sql = "SELECT * FROM daily_aggregates WHERE day >= date('now', ?) "
@@ -539,28 +636,172 @@ class MetricsStore:
         if provider:
             sql += "AND provider = ? "
             params.append(provider)
+        if model:
+            sql += "AND model = ? "
+            params.append(model)
         sql += "ORDER BY day DESC, cost_usd DESC"
         cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def query_recent_traces(self, limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
+    async def query_recent_traces(
+        self,
+        limit: int = 20,
+        status: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        days: int = 0,
+    ) -> list[dict[str, Any]]:
         db = self._require_db()
-        sql = "SELECT * FROM traces "
+        clauses: list[str] = []
         params: list[Any] = []
         if status:
-            sql += "WHERE status = ? "
+            clauses.append("status = ?")
             params.append(status)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        if days > 0:
+            clauses.append("created_at >= ?")
+            params.append(time.time() - days * 86400.0)
+
+        sql = "SELECT * FROM traces "
+        if clauses:
+            sql += "WHERE " + " AND ".join(clauses) + " "
         sql += "ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def query_summary(self) -> dict[str, Any]:
+    _SUMMARY_GROUP_COLUMNS = {
+        "provider": ("provider",),
+        "model": ("model",),
+        "provider_model": ("provider", "model"),
+    }
+
+    @staticmethod
+    def _time_window(
+        days: int, since: float | None = None
+    ) -> tuple[str, tuple[Any, ...]]:
+        """返回 created_at 的 epoch 时间窗条件（与 time.time() 写入保持一致）。
+
+        since 可由调用方预先计算并在多次查询间复用，避免 totals/items 使用
+        不同 cutoff 造成边界不一致。
+        """
+        if since is None and days > 0:
+            since = time.time() - days * 86400.0
+        if since is not None:
+            return "WHERE created_at >= ?", (since,)
+        return "", ()
+
+    async def query_summary(
+        self, group_by: str | None = None, days: int = 0
+    ) -> dict[str, Any]:
+        """累计用量概览；可选按 provider/model 维度分组。
+
+        默认（group_by=None）保持原扁平结构，向后兼容 CLI/看板。
+        """
+        since = time.time() - days * 86400.0 if days > 0 else None
+        totals = await self._query_summary_totals(days, since)
+        if group_by is None:
+            totals["days"] = days
+            return totals
+
+        columns = self._SUMMARY_GROUP_COLUMNS.get(group_by)
+        if columns is None:
+            raise ValueError(f"Unsupported summary group_by: {group_by}")
+
+        where, params = self._time_window(days, since)
+        group_expr = ", ".join(columns)
+        select_expr = ", ".join(columns)
+
+        sql = f"""
+            SELECT {select_expr},
+                   COUNT(*) AS requests,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                   COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+                   COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms,
+                   COALESCE(AVG(ttft_ms), 0.0) AS avg_ttft_ms,
+                   SUM(CASE WHEN estimated = 1 THEN 1 ELSE 0 END) AS estimated_requests,
+                   SUM(CASE WHEN estimated = 1 THEN total_tokens ELSE 0 END) AS estimated_tokens,
+                   SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS stream_requests,
+                   SUM(CASE WHEN fallback_used = 1 THEN 1 ELSE 0 END) AS fallback_requests
+            FROM usage_metrics
+            {where}
+            GROUP BY {group_expr}
+            ORDER BY cost_usd DESC, requests DESC
+        """
         db = self._require_db()
+        cursor = await db.execute(sql, params)
+        items = [dict(row) for row in await cursor.fetchall()]
+
+        # 错误数按同一维度、同一时间窗从 error_log 聚合后合并
+        err_sql = f"""
+            SELECT {select_expr}, COUNT(*) AS errors
+            FROM error_log
+            {where}
+            GROUP BY {group_expr}
+        """
+        cursor = await db.execute(err_sql, params)
+        err_map = {
+            tuple(row[col] for col in columns): int(row["errors"])
+            for row in await cursor.fetchall()
+        }
+        for item in items:
+            item["errors"] = err_map.get(tuple(item[col] for col in columns), 0)
+
+        # 只有失败、没有成功用量的 provider/model 也要出现在分组结果里，
+        # 否则 grouped summary 会隐藏"全失败"的组（requests=0, errors>0）。
+        known = {tuple(item[col] for col in columns) for item in items}
+        for key, errors in err_map.items():
+            if key in known or not all(key):
+                continue
+            item = {col: key[i] for i, col in enumerate(columns)}
+            item.update({
+                "requests": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "avg_latency_ms": 0.0,
+                "avg_ttft_ms": 0.0,
+                "estimated_requests": 0,
+                "estimated_tokens": 0,
+                "stream_requests": 0,
+                "fallback_requests": 0,
+                "errors": errors,
+            })
+            items.append(item)
+        items.sort(
+            key=lambda x: (x["cost_usd"], x["requests"], x["errors"]),
+            reverse=True,
+        )
+        for item in items:
+            total = item["requests"] + item["errors"]
+            item["total_requests"] = total
+            item["error_rate"] = round(item["errors"] / total, 6) if total else 0.0
+
+        return {
+            "group_by": group_by,
+            "days": days,
+            "totals": totals,
+            "items": items,
+        }
+
+    async def _query_summary_totals(
+        self, days: int = 0, since: float | None = None
+    ) -> dict[str, Any]:
+        """全局累计概览（原 query_summary 的默认返回结构）。"""
+        db = self._require_db()
+        where, params = self._time_window(days, since)
         cursor = await db.execute(
-            """
+            f"""
             SELECT COUNT(*) AS requests,
                    SUM(prompt_tokens) AS prompt_tokens,
                    SUM(completion_tokens) AS completion_tokens,
@@ -570,13 +811,24 @@ class MetricsStore:
                    AVG(ttft_ms) AS avg_ttft_ms,
                    COUNT(DISTINCT provider) AS providers
             FROM usage_metrics
-            """
+            {where}
+            """,
+            params,
         )
         row = await cursor.fetchone()
         summary = dict(row) if row else {}
-        cursor2 = await db.execute("SELECT COUNT(*) AS c FROM error_log")
+        cursor2 = await db.execute(
+            f"SELECT COUNT(*) AS c FROM error_log {where}", params
+        )
         row2 = await cursor2.fetchone()
         summary["errors"] = dict(row2)["c"] if row2 else 0
+        requests = int(summary.get("requests") or 0)
+        errors = int(summary["errors"] or 0)
+        total_requests = requests + errors
+        summary["total_requests"] = total_requests
+        summary["error_rate"] = (
+            round(errors / total_requests, 6) if total_requests else 0.0
+        )
         return summary
 
     # ── Prompt 模板（SPEC §4.5，按 template_id/version 保留历史）───────
@@ -609,6 +861,16 @@ class MetricsStore:
         if "completion_tokens" not in have:
             await db.execute(
                 "ALTER TABLE daily_aggregates ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0"
+            )
+
+    async def _migrate_error_log_if_needed(self) -> None:
+        """旧库 error_log 补齐 model 列（历史行无法反推模型，按空串处理）。"""
+        db = self._require_db()
+        info = await (await db.execute("PRAGMA table_info(error_log)")).fetchall()
+        have = {row["name"] for row in info}
+        if "model" not in have:
+            await db.execute(
+                "ALTER TABLE error_log ADD COLUMN model TEXT NOT NULL DEFAULT ''"
             )
 
     async def _migrate_prompt_templates_if_needed(self) -> None:

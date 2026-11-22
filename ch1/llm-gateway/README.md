@@ -210,9 +210,9 @@ providers:
 | GET | `/v1/models` | Bearer | 列出对外可用模型 |
 | POST | `/v1/chat/completions` | Bearer | 对话补全（普通 / 流式 / 结构化输出） |
 | GET/POST/DELETE | `/v1/templates...` | Bearer | 模板管理，详见下文 |
-| GET | `/v1/admin/summary` | Bearer | 累计用量概览 |
-| GET | `/v1/admin/traces` | Bearer | 最近追踪记录 |
-| GET | `/v1/admin/daily` | Bearer | 按天聚合用量与成本 |
+| GET | `/v1/admin/summary` | Bearer | 累计用量概览；`group_by=provider\|model\|provider_model` 分组，`days` 时间窗 |
+| GET | `/v1/admin/traces` | Bearer | 最近追踪记录；`provider/model/status/days` 过滤 |
+| GET | `/v1/admin/daily` | Bearer | 按天聚合用量与成本；`provider/model` 过滤 |
 | GET | `/healthz` | 无 | 存活探针 |
 | GET | `/readyz` | 无 | 就绪探针 |
 | GET | `/metrics` | 无 | Prometheus 文本指标 |
@@ -667,7 +667,9 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 - 认证失败（上游 401/403）不重试，对外统一映射为 `502`，不泄漏上游鉴权细节。
 - 缺少 Key 视为配置问题：跳过该候选、不重试、不计入熔断。
 - 单候选重试耗尽后切换下一候选；流式请求一旦某候选成功即停止，避免多个供应商的内容拼接。
-- 流式首 token 后断流会记录 `partial_failed`，并计入熔断失败；客户端断连记录 `cancelled`，不计费。
+- **流式首字节后失败即终止**：已向客户端下发 delta/finish_reason 后不再 fallback，防止把下一候选的输出拼接到半截内容之后；未下发字节时仍正常重试/切换候选。
+- 流式首 token 后断流会记录 `partial_failed` 并计入熔断失败；半程观测写入独立的 `stream_attempt_failures` 表，`traces` 只在请求终态写一次；客户端断连记录 `cancelled`，不计费。
+- 非流式与流式共用 `RetryFallbackManager` 的候选链/重试/熔断状态机，重试策略只需改一处。
 
 ### 熔断
 
@@ -682,13 +684,15 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 - 按 Provider 能力降级 `response_format`：`json_schema` 原样透传；`json_object` 追加 JSON 提示词并注入完整 schema；`none` 由适配器用提示约束兜底。
 - 本地 validator 是唯一校验权威：先严格解析，失败后尝试提取平衡的 `{...}` / `[...]` 块自动修复；仍失败则重试 / fallback。
 - 流式默认事后校验；请求设置 `buffer_until_valid: true` 时，改用非流式上游调用，校验/修复通过后才一次性下发 SSE。
-- 上游对 `response_format` 返回 400 时，去掉该参数并补充 JSON 提示词重试一次。
+- 上游对 `response_format` 返回 400 时，去掉该参数并补充 JSON 提示词重试一次；该降级**不消耗重试 attempt**，且每个候选最多降级一次（非流式/流式一致）。
 - schema 校验器按 LRU 缓存（上限 256），防止恶意唯一 schema 撑爆内存。
 - 消息中命中角色伪装、指令覆盖等启发式规则时返回 `400 prompt_injection_detected`；该机制是启发式防护，不是绝对安全边界。
 
 ### 计费与追踪
 
 成功请求按实际 usage 与分价写入 `usage_metrics`，并同步累计 `daily_aggregates`；`billing_id` 不含 attempt 序号，客户端用同一 `billing_id` 重试不会重复计费。trace 记录请求快照、状态、provider/model、耗时、TTFT、尝试次数与成本；流式记录 TTFT 与半程状态。
+
+失败请求的最终 provider/model 会同时写入 `traces`、`error_log`（含 model 列）与 `daily_aggregates.errors`。这里的“失败”指**进入候选链后的终态失败**（上游错误 / 部分输出后失败）；限流、参数校验等请求前置拒绝不会写入这三处，客户端取消也不计入。
 
 ## 错误码
 
@@ -747,15 +751,28 @@ curl -sS http://localhost:8000/metrics
 
 | 端点 | 说明 | 关键参数 |
 |---|---|---|
-| `GET /v1/admin/summary` | 累计概览（请求数 / token / 成本 / 平均时延 / 错误数） | — |
-| `GET /v1/admin/traces` | 最近追踪记录（不含 prompt/response 原文） | `limit`(1~200，默认 20)、`status` |
-| `GET /v1/admin/daily` | 按天聚合的用量与成本 | `days`(1~90，默认 7)、`provider` |
+| `GET /v1/admin/summary` | 累计概览（请求数 / token / 成本 / 平均时延 / 错误数）；支持按 provider/model 分组 | `group_by=provider\|model\|provider_model`、`days`(0~365，0=全量) |
+| `GET /v1/admin/traces` | 最近追踪记录（不含 prompt/response 原文） | `limit`(1~200，默认 20)、`status`(success/error/partial_failed/cancelled)、`provider`、`model`、`days`(0~365) |
+| `GET /v1/admin/daily` | 按天聚合的用量与成本 | `days`(1~90，默认 7)、`provider`、`model` |
 
 ```bash
 curl -sS http://localhost:8000/v1/admin/summary -H "Authorization: Bearer sk-gateway-dev"
-curl -sS "http://localhost:8000/v1/admin/traces?limit=10&status=error" -H "Authorization: Bearer sk-gateway-dev"
-curl -sS "http://localhost:8000/v1/admin/daily?days=7" -H "Authorization: Bearer sk-gateway-dev"
+curl -sS "http://localhost:8000/v1/admin/summary?group_by=provider_model&days=30" -H "Authorization: Bearer sk-gateway-dev"
+curl -sS "http://localhost:8000/v1/admin/traces?limit=10&status=error&provider=ok&model=ok&days=7" -H "Authorization: Bearer sk-gateway-dev"
+curl -sS "http://localhost:8000/v1/admin/daily?days=7&provider=ok&model=ok" -H "Authorization: Bearer sk-gateway-dev"
 ```
+
+`summary` 不传 `group_by` 时保持原扁平结构，并回显 `days / total_requests / error_rate`；传 `group_by` 时返回 `{group_by, days, totals, items}`，`items` 含 `requests / total_requests / errors / error_rate / prompt_tokens / completion_tokens / total_tokens / cost_usd / avg_latency_ms / avg_ttft_ms / estimated_requests / estimated_tokens / stream_requests / fallback_requests`。估算行的 `cost_usd` 为 0，核对成本时应结合 `estimated_*` 字段排除估算用量。
+
+口径说明：
+
+- `requests` = 成功计费用量；`errors` = 进入候选链后的终态失败；`total_requests = requests + errors`，`error_rate = errors / total_requests`。
+- 只有失败、没有成功用量的组会以 `requests=0, errors>0` 出现在 `items` 中；其 `avg_latency_ms / avg_ttft_ms = 0` 表示“没有成功样本”，不是真实 0ms。
+- `totals.errors` 是全局 `error_log` 计数；极少数没有 provider/model 归因的记录只出现在 totals 中，因此可能略大于各分组 `errors` 之和。
+- `summary/traces` 的 `days` 是滚动 24h 窗口；`daily` 按自然日聚合，两者口径不同。
+- `totals` 与 `items` 由多条 SQL 查询组成，admin 查询是最终一致视图，不保证严格同一快照。
+- 历史数据中 provider/model 为空的行不会参与分组/过滤（归因是后续修复才补齐的，无法从旧数据可靠反推）。
+- 缺 Key（`config_missing`）会计入 provider 终态错误率；如需把配置问题与 provider 故障分开，需要另加配置错误维度。
 
 超出上限的参数（如 `limit=99999`）会直接返回 `400 invalid_request`，不做静默截断。
 
@@ -854,8 +871,9 @@ SELECT
 
 ```powershell
 .\.venv\Scripts\python.exe -m cli.gateway_cli summary
-.\.venv\Scripts\python.exe -m cli.gateway_cli daily --days 7
-.\.venv\Scripts\python.exe -m cli.gateway_cli traces --status error
+.\.venv\Scripts\python.exe -m cli.gateway_cli summary --group-by provider_model --days 30
+.\.venv\Scripts\python.exe -m cli.gateway_cli daily --days 7 --provider ok --model ok
+.\.venv\Scripts\python.exe -m cli.gateway_cli traces --status error --provider ok --model ok --days 7
 .\.venv\Scripts\python.exe -m cli.gateway_cli circuit
 ```
 
@@ -863,12 +881,13 @@ SELECT
 
 ```bash
 .venv/Scripts/python -m cli.gateway_cli summary
-.venv/Scripts/python -m cli.gateway_cli daily --days 7
-.venv/Scripts/python -m cli.gateway_cli traces --status error
+.venv/Scripts/python -m cli.gateway_cli summary --group-by provider_model --days 30
+.venv/Scripts/python -m cli.gateway_cli daily --days 7 --provider ok --model ok
+.venv/Scripts/python -m cli.gateway_cli traces --status error --provider ok --model ok --days 7
 .venv/Scripts/python -m cli.gateway_cli circuit
 ```
 
-CLI 还支持 `--db` 指定 SQLite 路径（默认 `data/metrics.db`）；`traces` 支持 `--limit` 与 `--status success|error|cancelled`，`daily` 支持 `--days` 与 `--provider`。
+CLI 还支持 `--db` 指定 SQLite 路径（默认 `data/metrics.db`）；`summary` 支持 `--group-by provider|model|provider_model` 与 `--days`，`traces` 支持 `--limit`、`--status`、`--provider`、`--model`、`--days`，`daily` 支持 `--days`、`--provider`、`--model`。
 
 ### 模板管理（CLI）
 

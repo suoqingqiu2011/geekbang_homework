@@ -18,7 +18,8 @@ from typing import Any
 
 import pytest
 
-from app.api.chat import _is_cancellation, _record_cancelled_trace
+from app.api.chat import _record_cancelled_trace
+from app.core.cancellation import is_cancellation
 from app.core.trace_freeze import TraceFreezeRecord
 
 
@@ -26,26 +27,26 @@ from app.core.trace_freeze import TraceFreezeRecord
 # 取消识别 _is_cancellation
 # ─────────────────────────────────────────────────────────────
 def test_is_cancellation_plain_cancelled():
-    assert _is_cancellation(asyncio.CancelledError()) is True
+    assert is_cancellation(asyncio.CancelledError()) is True
 
 
 def test_is_cancellation_exception_group_wrapping_cancel():
     # Starlette/anyio 结构化并发把取消包装为 BaseExceptionGroup
     exc = BaseExceptionGroup("cancelled", [asyncio.CancelledError()])
-    assert _is_cancellation(exc) is True
+    assert is_cancellation(exc) is True
 
 
 def test_is_cancellation_nested_group():
     exc = BaseExceptionGroup("outer", [
         BaseExceptionGroup("inner", [ValueError(), asyncio.CancelledError()])
     ])
-    assert _is_cancellation(exc) is True
+    assert is_cancellation(exc) is True
 
 
 def test_is_cancellation_other_errors_false():
-    assert _is_cancellation(ValueError("boom")) is False
-    assert _is_cancellation(RuntimeError("boom")) is False
-    assert _is_cancellation(ExceptionGroup("", [ValueError(), RuntimeError()])) is False
+    assert is_cancellation(ValueError("boom")) is False
+    assert is_cancellation(RuntimeError("boom")) is False
+    assert is_cancellation(ExceptionGroup("", [ValueError(), RuntimeError()])) is False
 
 
 # ─────────────────────────────────────────────────────────────

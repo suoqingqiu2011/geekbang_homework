@@ -18,5 +18,15 @@ services:
       - ./config:/srv/gateway/config:ro
     restart: unless-stopped
 
+  # 可选：本地/离线跑完整 pytest。默认不启动，避免 docker compose up 误跑测试。
+  # 用法：docker compose --profile test run --rm tests
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.test
+    image: llm-gateway-test:1.0.0
+    command: python -m pytest tests -q
+
 volumes:
   gateway-data:
