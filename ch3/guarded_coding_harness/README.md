@@ -4,6 +4,25 @@
 
 完成契约只认真实测试证据（`kind` 为 `test` / `test_run`，且 `returncode == 0`、指纹与当前工区一致）；`note`、`finding`、`check` 等自报记录不能作为交付物。
 
+**核心保证**
+
+- **唯一受支持入口**：`ToolRuntime.invoke` 只执行 Gate 在本批次签发 `ALLOW` 的工具调用；绕过 `agent.run` 直接调用会被拒绝。
+- **审批**：批准票绑定「签名 + 工区指纹 + 步骤」；审批挂起不消耗 `repeat_limit`，重复挂起由 `pending_retry_limit` 约束。
+- **重复上限**：按风险分级（写 2 / 读 6 / 控制类 8），按 run 累计。
+- **沙箱与预算**：路径/命令约束、超时与进程树清理；`max_*` 预算在批次内预占。
+- **完成与审计**：完成只认当前指纹的真实测试证据；审计链 append-only 且可用 `audit.verify()` 校验。
+
+**文档导航**
+
+- [1. 环境要求](#1-环境要求)
+- [2. 安装依赖](#2-安装依赖)
+- [3. 快速开始](#3-快速开始)
+- [4. 以编程方式使用](#4-以编程方式使用)
+- [5. 运行时产物](#5-运行时产物)
+- [6. 测试使用指南](#6-测试使用指南)
+- [7. 项目目录结构（代码文件）](#7-项目目录结构代码文件)
+- [8. 安全边界与已知限制](#8-安全边界与已知限制)
+
 ---
 
 ## 1. 环境要求
@@ -499,6 +518,14 @@ assert ok, message
 ### 5.2 完整运行记录 + 审计记录 + checkpoint恢复记录
 
 以下三条记录取自仓库内已落盘的产物，可分别用 `python scripts/demo_run.py`、`python scripts/real_model_run.py` 与 `python scripts/real_model_approval_run.py` 复现。每次运行的 `run_id` 与哈希不同，但事件结构、证据契约与完成判定一致。
+
+| 记录 | 模型 | 关键路径 | 用途 |
+|---|---|---|---|
+| A | `ScriptedModel` | 审批停机 → `resume()` → `completed` | 确定性验证审批、恢复、审计与 checkpoint |
+| B | `deepseek-v4-pro` | 无审批直写 → 测试 → `final_answer` | 验证真实模型在 `require_write_approval=False` 下的行为 |
+| C | `deepseek-v4-pro` | 审批 → `resume()` → `completed` | 验证真实模型 + 完整审批链路 |
+
+> 这三条记录是历史产物，生成时使用的策略默认值可能早于当前版本（例如风险分级重复上限、`invoke` 票据复核、`pending_retry_limit`）。事件结构与证据契约仍可复现，但请以当前代码和最新 `pytest-q.txt` 为准。
 
 #### 记录 A：离线演示（`ScriptedModel`，确定性，含审批停机）
 
@@ -1416,7 +1443,7 @@ guarded_coding_harness/
 │   └── harness.py                  # 装配层与 GuardedToolCallingAgent
 └── tests/
     ├── conftest.py                 # 共享 fixture 与 ScriptedModel
-    ├── test_gate.py                # G1–G4、S1（Gate 级）
+    ├── test_gate.py                # G1–G4、S1、批次审计归属、重复上限、全工具签名往返
     ├── test_sandbox.py             # S1–S4、工作区指纹
     ├── test_state_checkpoint.py    # 三态、快照、恢复计划、C1/C3
     ├── test_audit.py               # A1/A2、篡改检测
@@ -1434,3 +1461,13 @@ artifacts/.harness/
 ├── checkpoints/<run_id>/step-XXXXXX-<boundary>.json
 └── logs/<ulid>.log
 ```
+
+---
+
+## 8. 安全边界与已知限制
+
+- **入口边界**：`ToolRuntime.invoke` 是唯一受支持的工具执行入口；私有 `_do_*` 方法不属于受支持入口。同进程代码若直接调用私有方法，仍可绕过 `invoke`，这类场景已超出当前威胁模型。
+- **审计归属**：同一批次内参数完全相同的重复调用共享一个签名，审计只能稳定归属到该签名的调用集合；需要逐调用严格区分时，可把 `_calls` 升级为按签名队列（当前 `max_tool_threads=1`，工具按顺序执行）。
+- **计数口径**：`repeat_limit` / `pending_count` 按 run 累计，不是滑动窗口；`pending_count` 在写入成功或 reconcile-release 后不会自动复位。
+- **旧状态迁移**：旧台账缺少 `attempts` / `pending_count` 时按 0 读取；长期复用旧 `state.json` 时建议先归一化。
+- **停机原因**：`PolicyDenied` 若发生在 smolagents 工具执行内部，可能被包装为 `AgentToolExecutionError`；工具不会执行，但 `stop_reason` 可能不是 `policy_denied`。
