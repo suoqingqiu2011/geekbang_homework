@@ -663,19 +663,19 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 
 ### 重试与降级
 
-- 可重试：`408`、`425`、`429`、`5xx`、超时与常见网络错误；默认最多 3 次，指数退避（0.5s 起、上限 8s、20% 抖动）。
+- 可重试：`408`、`425`、`429`、`500/502/503/504`、超时与常见网络错误；默认最多 3 次，指数退避（0.5s 起、上限 8s、20% 抖动）。
 - 认证失败（上游 401/403）不重试，对外统一映射为 `502`，不泄漏上游鉴权细节。
 - 缺少 Key 视为配置问题：跳过该候选、不重试、不计入熔断。
 - 单候选重试耗尽后切换下一候选；流式请求一旦某候选成功即停止，避免多个供应商的内容拼接。
 - **流式首字节后失败即终止**：已向客户端下发 delta/finish_reason 后不再 fallback，防止把下一候选的输出拼接到半截内容之后；未下发字节时仍正常重试/切换候选。
 - 流式首 token 后断流会记录 `partial_failed` 并计入熔断失败；半程观测写入独立的 `stream_attempt_failures` 表，`traces` 只在请求终态写一次；客户端断连记录 `cancelled`，不计费。
 - 非流式与流式共用 `RetryFallbackManager` 的候选链/重试/熔断状态机，重试策略只需改一处。
-- **实现选择**：流式事件由 `RetryFallbackManager.stream()` 以 async generator 产出，而不是回调。原因：回调不能 `yield`，要实时下发必须额外引入 `asyncio.Queue` 桥接，并处理 producer 取消/背压；async generator 保持“manager 持有状态机、路由只消费事件”的同一目标，失败模式更少。
-- **边界**：Adapter 内部的 `stream_options` 400 兼容重试仍留在适配器（供应商协议细节，不参与候选链、不消耗 attempt、不计熔断）；`buffer_until_valid` 走非流式 `execute()`，因为它在下发前完成校验，允许安全 fallback。
+- **实现选择**：流式事件由 `RetryFallbackManager.stream()` 以 async generator 产出，而不是回调。原因：回调不能 `yield`，要实时下发必须额外引入 `asyncio.Queue` 桥接，并处理 producer 取消与背压；async generator 保持“manager 持有状态机、路由只消费事件”的同一目标，避免额外的队列生命周期。
+- **边界**：Adapter 内部的 `stream_options` 400 兼容重试仍留在适配器（供应商协议细节，不参与候选链、不计熔断；它不消耗 `RetryFallbackManager` 的逻辑 attempt，但可能多一次上游请求）；`buffer_until_valid` 复用非流式 `execute()`，因为它在下发前完成校验，允许安全 fallback。
 
 ### 熔断
 
-按 Provider 维护状态机 `CLOSED → OPEN → HALF_OPEN → CLOSED/OPEN`，状态持久化在 SQLite，跨 worker 一致。默认连续失败 5 次打开，30 秒后进入半开并最多放行 3 个探针请求。路由前与每次上游调用前都会检查。
+按 Provider 维护状态机 `CLOSED → OPEN → HALF_OPEN → CLOSED/OPEN`，状态持久化在 SQLite，跨 worker 一致。默认连续失败 5 次打开，30 秒后进入半开并最多放行 3 个探针请求。路由前与每个候选进入 attempt 循环前都会检查；同一候选内的 retry 不会重复走路由/熔断门禁。
 
 ### 分层限流
 
@@ -692,7 +692,7 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 
 ### 计费与追踪
 
-成功请求按实际 usage 与分价写入 `usage_metrics`，并同步累计 `daily_aggregates`；`billing_id` 不含 attempt 序号，客户端用同一 `billing_id` 重试不会重复计费。trace 记录请求快照、状态、provider/model、耗时、TTFT、尝试次数与成本；流式记录 TTFT 与半程状态。
+成功请求按实际 usage 与分价写入 `usage_metrics`，并同步累计 `daily_aggregates`；`billing_id` 由服务端按请求生成、不含 attempt 序号，因此同一请求内部的重试/重复记账不会重复计费。客户端重试是一次新请求，会生成新的 `billing_id`，成功时仍会正常计费。trace 记录请求快照、状态、provider/model、耗时、TTFT、尝试次数与成本；流式记录 TTFT 与半程状态。
 
 失败请求的最终 provider/model 会同时写入 `traces`、`error_log`（含 model 列）与 `daily_aggregates.errors`。这里的“失败”指**进入候选链后的终态失败**（上游错误 / 部分输出后失败）；限流、参数校验等请求前置拒绝不会写入这三处，客户端取消也不计入。
 
@@ -766,7 +766,7 @@ curl -sS "http://localhost:8000/v1/admin/traces?limit=10&status=error&provider=o
 curl -sS "http://localhost:8000/v1/admin/daily?days=7&provider=ok&model=ok" -H "Authorization: Bearer sk-gateway-dev"
 ```
 
-`summary` 不传 `group_by` 时保持原扁平结构，并回显 `days / total_requests / error_rate`；传 `group_by` 时返回 `{group_by, days, totals, items}`，`items` 含 `requests / total_requests / errors / error_rate / prompt_tokens / completion_tokens / total_tokens / cost_usd / avg_latency_ms / avg_ttft_ms / estimated_requests / estimated_tokens / stream_requests / fallback_requests`。估算行的 `cost_usd` 为 0，核对成本时应结合 `estimated_*` 字段排除估算用量。
+`summary` 不传 `group_by` 时返回扁平 totals 结构（在原字段基础上新增 `days / total_requests / error_rate`）；传 `group_by` 时返回 `{group_by, days, totals, items}`，`items` 含 `requests / total_requests / errors / error_rate / prompt_tokens / completion_tokens / total_tokens / cost_usd / avg_latency_ms / avg_ttft_ms / estimated_requests / estimated_tokens / stream_requests / fallback_requests`。估算行的 `cost_usd` 为 0，核对成本时应结合 `estimated_*` 字段排除估算用量。
 
 口径说明：
 
@@ -775,7 +775,7 @@ curl -sS "http://localhost:8000/v1/admin/daily?days=7&provider=ok&model=ok" -H "
 - `totals.errors` 是全局 `error_log` 计数；极少数没有 provider/model 归因的记录只出现在 totals 中，因此可能略大于各分组 `errors` 之和。
 - `summary/traces` 的 `days` 是滚动 24h 窗口；`daily` 按自然日聚合，两者口径不同。
 - `totals` 与 `items` 由多条 SQL 查询组成，admin 查询是最终一致视图，不保证严格同一快照。
-- 历史数据中 provider/model 为空的行不会参与分组/过滤（归因是后续修复才补齐的，无法从旧数据可靠反推）。
+- 历史数据中 provider/model 为空的行不会参与**按 provider/model 的分组/过滤**（未加过滤时仍会出现在 traces 明细中）；归因是后续修复才补齐的，无法从旧数据可靠反推。
 - 缺 Key（`config_missing`）会计入 provider 终态错误率；如需把配置问题与 provider 故障分开，需要另加配置错误维度。
 
 超出上限的参数（如 `limit=99999`）会直接返回 `400 invalid_request`，不做静默截断。
@@ -794,21 +794,24 @@ server:
 
 部署在 nginx / 负载均衡之后时**必须**开启并登记代理地址，否则所有请求的 `client_ip` 都会变成代理自身地址（如 `127.0.0.1`）。开启后从右向左跳过可信代理，取第一个非可信地址作为客户端 IP（左侧条目可被客户端任意伪造，因此不会被采用）；非法地址会被忽略并回落对端地址。
 
-### 成本口径：只统计成功请求（观察表）
+### 成本口径：预算只统计成功请求（观察表）
 
-**预算判定与日报成本只统计成功请求。** 失败请求的上游花费可能已经产生（超时、200 但结构校验失败），但不进入 `usage_metrics`，因此 `query_spent_usd` / `daily_aggregates` 会**系统性偏低**。为在不改变计费行为的前提下量化这一偏差，网关额外维护一张观察表。
+**预算判定与日报成本只统计成功请求。** 失败请求的上游花费可能已经产生（超时、200 但结构校验失败），但不进入 `usage_metrics`，因此 `query_spent_usd` 与 `daily_aggregates` 的成本列会**系统性偏低**。为在不改变计费行为的前提下量化这一偏差，网关额外维护观察表。
 
 | 数据源 | 统计范围 | 是否参与预算 |
 |---|---|---|
-| `usage_metrics` / `daily_aggregates` | 仅成功请求（`estimated` 行成本为 0） | 是 |
+| `usage_metrics` | 成功请求的实际 usage 与成本（`estimated` 行成本为 0） | 是 |
+| `daily_aggregates` | 成功用量的 requests/token/cost + 终态失败计数 errors；失败-only 行 `requests=0` | 否（仅报表） |
 | `unbilled_attempt_costs` | 失败但仍可能计费的尝试（估算值） | 否 |
+
+> `stream_attempt_failures` 是流式半程失败观测表（provider/model/attempt/stream_chars），不参与成本/预算；它只做半程观测，终态失败仍由 `error_log` 记录。
 
 观察表规则：
 
 - `reason` 取失败的错误码。`upstream_timeout`、`structured_output_failed`、`upstream_error`（4xx 与 429 除外）会记录；400/401/403/404/422/429、缺少 Key、路由阶段即被拒的 `model_unavailable` / `budget_exhausted` / `rate_limit_exceeded` 不记录。
 - 成本口径为 `prompt_tokens/1e6 × prompt单价`，completion 记为 0，`estimated` 恒为 1；该值是**下界估算**，不用于对账。
 - 主键为 `billing_id:provider:model`（不含 attempt 序号），同候选重试只记一条；一次请求在多个候选上先后失败会产生多行。
-- 保留期见 `storage.unbilled_retention_days`（env `GATEWAY_UNBILLED_RETENTION_DAYS`），默认 30 天，`<=0` 表示不清理；启动时清理一次，之后每 6 小时一次，只删该表。
+- 保留期见 `storage.unbilled_retention_days`（env `GATEWAY_UNBILLED_RETENTION_DAYS`），默认 30 天，`<=0` 表示不清理；启动时清理一次，之后每 6 小时一次，只清理 `unbilled_attempt_costs` 与 `stream_attempt_failures`，不触碰 `usage_metrics` / `traces` / `error_log`。
 
 表在启动时随 `executescript` 自动创建（老库无需迁移）。查询示例：
 
@@ -827,7 +830,7 @@ asyncio.run(main())
 '@ | .\.venv\Scripts\python.exe -
 ```
 
-**确认采集在工作**：`error_log` 中 `upstream_timeout` / `structured_output_failed` / `upstream_error` 有量时，观察表也应有数据；若为 0 行，说明采集未生效。交叉验证（列名是 `error_code`，不是 `code`）：
+**确认采集在工作**：`error_log` 中 `upstream_timeout`、`structured_output_failed`、5xx 的 `upstream_error` 有量时，观察表也应有数据；4xx/429、缺少 Key 不会写入观察表。若上述失败有量但观察表为 0 行，说明采集未生效。交叉验证（列名是 `error_code`，不是 `code`）：
 
 ```sql
 SELECT error_code, COUNT(*) FROM error_log GROUP BY error_code ORDER BY 2 DESC;
@@ -955,8 +958,8 @@ CLI 还支持 `--db` 指定 SQLite 路径（默认 `data/metrics.db`）；`summa
 
 - **GitHub Actions**：仓库根 `.github/workflows/llm-gateway-tests.yml` 在 push/PR 命中 `ch1/llm-gateway/**` 时运行完整 `pytest tests`，并上传 JUnit 报告。workflow 使用 `permissions: contents: read` 与 `concurrency` 取消过期运行。
 - **docker-compose**：`docker compose --profile test run --rm tests` 使用 `docker/Dockerfile.test` 在容器内跑同一套测试；`profiles: ["test"]` 保证 `docker compose up` 不会误跑测试。
-- **分支保护**：`main` 已配置 required check `pytest`（UI 显示为 `llm-gateway-tests / pytest`），当前 `enforcement=non_admins`。这允许管理员在紧急情况下 bypass/直接 push，避免 CI 故障时锁死仓库；若要求 main 必须始终绿色，需把 enforcement 收紧到 everyone，并按需启用 Require a pull request。
-- **边界**：CI path filter 只关注 `ch1/llm-gateway/**` 和 workflow 自身；修改其它章节不会触发该 workflow。如果要求“每次 push 必跑”，删除 `push.paths`。
+- **分支保护**：`main` 已配置 required check `pytest`（UI 显示为 `llm-gateway-tests / pytest`），当前 `enforcement=non_admins`。当前规则主要约束 PR 合并，**没有启用 Require a pull request**，因此直接 push 仍取决于写权限；`non_admins` 表示管理员可 bypass 该检查。若要求 main 必须始终绿色，需把 enforcement 收紧到 everyone，并按需启用 Require a pull request（或使用 ruleset 限制直接推送）。
+- **边界**：push 的 path filter 关注 `ch1/llm-gateway/**` 和 workflow 自身；PR 只关注 `ch1/llm-gateway/**`。修改其它章节不会触发该 workflow。如果要求“每次 push 必跑”，删除 `push.paths`。
 - **验证结果**：GitHub Actions run 已通过；compose 容器内完整测试 **234 passed**。
 
 ## 常见问题
