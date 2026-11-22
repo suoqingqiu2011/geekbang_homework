@@ -670,6 +670,8 @@ curl -X DELETE http://127.0.0.1:8000/v1/templates/tpl-greet -H "Authorization: B
 - **流式首字节后失败即终止**：已向客户端下发 delta/finish_reason 后不再 fallback，防止把下一候选的输出拼接到半截内容之后；未下发字节时仍正常重试/切换候选。
 - 流式首 token 后断流会记录 `partial_failed` 并计入熔断失败；半程观测写入独立的 `stream_attempt_failures` 表，`traces` 只在请求终态写一次；客户端断连记录 `cancelled`，不计费。
 - 非流式与流式共用 `RetryFallbackManager` 的候选链/重试/熔断状态机，重试策略只需改一处。
+- **实现选择**：流式事件由 `RetryFallbackManager.stream()` 以 async generator 产出，而不是回调。原因：回调不能 `yield`，要实时下发必须额外引入 `asyncio.Queue` 桥接，并处理 producer 取消/背压；async generator 保持“manager 持有状态机、路由只消费事件”的同一目标，失败模式更少。
+- **边界**：Adapter 内部的 `stream_options` 400 兼容重试仍留在适配器（供应商协议细节，不参与候选链、不消耗 attempt、不计熔断）；`buffer_until_valid` 走非流式 `execute()`，因为它在下发前完成校验，允许安全 fallback。
 
 ### 熔断
 
@@ -754,6 +756,8 @@ curl -sS http://localhost:8000/metrics
 | `GET /v1/admin/summary` | 累计概览（请求数 / token / 成本 / 平均时延 / 错误数）；支持按 provider/model 分组 | `group_by=provider\|model\|provider_model`、`days`(0~365，0=全量) |
 | `GET /v1/admin/traces` | 最近追踪记录（不含 prompt/response 原文） | `limit`(1~200，默认 20)、`status`(success/error/partial_failed/cancelled)、`provider`、`model`、`days`(0~365) |
 | `GET /v1/admin/daily` | 按天聚合的用量与成本 | `days`(1~90，默认 7)、`provider`、`model` |
+
+**为什么 traces 不做 group-by**：`traces` 是请求明细表，`group-by` 会丢失 `trace_id`/`status` 等行级信息，并与 summary 的聚合职责重复。因此 `traces` 只提供 `provider/model/status/days` 过滤；按 provider/model 的 token、成本、错误率聚合统一走 `summary`，按天的时间序列走 `daily`。
 
 ```bash
 curl -sS http://localhost:8000/v1/admin/summary -H "Authorization: Bearer sk-gateway-dev"
@@ -947,6 +951,14 @@ CLI 还支持 `--db` 指定 SQLite 路径（默认 `data/metrics.db`）；`summa
 .\.venv\Scripts\python.exe -m pytest tests -v --cov=app --cov-report=term
 ```
 
+### CI 与容器化测试
+
+- **GitHub Actions**：仓库根 `.github/workflows/llm-gateway-tests.yml` 在 push/PR 命中 `ch1/llm-gateway/**` 时运行完整 `pytest tests`，并上传 JUnit 报告。workflow 使用 `permissions: contents: read` 与 `concurrency` 取消过期运行。
+- **docker-compose**：`docker compose --profile test run --rm tests` 使用 `docker/Dockerfile.test` 在容器内跑同一套测试；`profiles: ["test"]` 保证 `docker compose up` 不会误跑测试。
+- **分支保护**：`main` 已配置 required check `pytest`（UI 显示为 `llm-gateway-tests / pytest`），当前 `enforcement=non_admins`。这允许管理员在紧急情况下 bypass/直接 push，避免 CI 故障时锁死仓库；若要求 main 必须始终绿色，需把 enforcement 收紧到 everyone，并按需启用 Require a pull request。
+- **边界**：CI path filter 只关注 `ch1/llm-gateway/**` 和 workflow 自身；修改其它章节不会触发该 workflow。如果要求“每次 push 必跑”，删除 `push.paths`。
+- **验证结果**：GitHub Actions run 已通过；compose 容器内完整测试 **234 passed**。
+
 ## 常见问题
 
 ### 上游请求全部返回 502
@@ -1038,7 +1050,11 @@ $ python -m cli.gateway_cli traces --status error
 $ python -m cli.gateway_cli traces --status success
 { ... "provider": "qwen", "model": "qwen-max", "status": "success", ... }
 $ python -m cli.gateway_cli summary
+days               0
 requests           29
+total_requests     45
+errors             16
+error_rate         0.3556
 prompt_tokens      531
 completion_tokens  510
 total_tokens       1041
@@ -1046,7 +1062,6 @@ total_cost         $0.0011
 avg_latency_ms     2710.6
 avg_ttft_ms        677.3
 providers          2
-errors             16
 ```
 
 该记录同时验证：候选链评分/重试/熔断过滤、trace 状态列与 payload 一致性、CLI 状态过滤正确。
@@ -1060,11 +1075,14 @@ app/
   api/admin.py          # /v1/admin 指标只读查询端点（summary/traces/daily）
   static/templates.html # /ui/templates 单文件模板管理页
   core/                 # 鉴权/限流/路由/熔断/取消/连接池/渲染/校验/配置/指标
+  core/retry_fallback.py # 候选链 + 重试 + 熔断记账统一状态机
   adapters/             # openai-compat / anthropic 适配器 + 注册表
   storage/              # MetricsStore（SQLite WAL + 幂等计费）
   main.py               # FastAPI 入口 + 生命周期 + 配置热更新 + /healthz /readyz /metrics
 cli/gateway_cli.py      # 运维查询 CLI
 config/gateway.yaml     # 配置（支持热更新）
-docker/                 # Dockerfile（H3 待评审）
+docker/                 # Dockerfile.gateway（运行时）/ Dockerfile.test（测试）
 tests/                  # E2E（全 mock）+ 单测
 ```
+
+> CI 位于仓库根 `.github/workflows/llm-gateway-tests.yml`（不在本目录内），因为它必须放在 Git 仓库根才能被 GitHub Actions 识别。
