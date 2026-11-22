@@ -4,13 +4,13 @@ rootdir: C:\projet\homework\ch3\guarded_coding_harness
 configfile: pyproject.toml
 testpaths: tests
 plugins: anyio-4.16.0
-collected 74 items
+collected 78 items
 
 tests\test_audit.py .....                                                [  6%]
-tests\test_completion.py .........                                       [ 18%]
-tests\test_gate.py .............                                         [ 36%]
-tests\test_harness_loop.py ......................                        [ 66%]
-tests\test_sandbox.py ...........                                        [ 81%]
+tests\test_completion.py .........                                       [ 17%]
+tests\test_gate.py .................                                     [ 39%]
+tests\test_harness_loop.py ......................                        [ 67%]
+tests\test_sandbox.py ...........                                        [ 82%]
 tests\test_state_checkpoint.py ..............                            [100%]
 
-============================= 74 passed in 9.15s ==============================
+============================= 78 passed in 9.73s ==============================

@@ -42,6 +42,7 @@ class ToolSpec:
     optional: tuple[str, ...] = ()
     types: dict[str, Any] = field(default_factory=dict)
     choices: dict[str, set[Any]] = field(default_factory=dict)
+    defaults: dict[str, Any] = field(default_factory=dict)
     pre_check: PreCheck | None = None
     hint: str = ""
 
@@ -135,6 +136,12 @@ class Gate:
 
     # -- 判定 ---------------------------------------------------------------
     def evaluate(self, request: ActionRequest, *, batch: _BatchAccounting | None = None) -> GateVerdict:
+        verdict = self._evaluate(request, batch=batch)
+        if request.signature:
+            self._decisions[request.signature] = verdict.decision
+        return verdict
+
+    def _evaluate(self, request: ActionRequest, *, batch: _BatchAccounting | None = None) -> GateVerdict:
         spec = self.specs.get(request.tool_name)
         if spec is None:
             return self._deny(request, "unknown_tool", f"未知工具：{request.tool_name}", "unknown_tool")
@@ -144,6 +151,8 @@ class Gate:
         if error is not None:
             error.tool_call_id = request.tool_call_id
             return GateVerdict(request=request, decision=Decision.DENY, rule="arguments", error=error)
+        for key, value in spec.defaults.items():
+            cleaned.setdefault(key, value)
         request.arguments = cleaned
         request.signature = call_signature(request.tool_name, cleaned)
 
@@ -186,10 +195,11 @@ class Gate:
                 ),
             )
 
-        repeat_count = self.state.ledger_count(request.signature)
+        repeat_count = self.state.ledger_attempts(request.signature)
         if batch is not None:
             repeat_count += batch.count(request.signature)
-        if repeat_count >= int(self.policy.repeat_limit):
+        repeat_limit = self.policy.repeat_limit_for(spec.risk)
+        if repeat_count >= repeat_limit:
             return GateVerdict(
                 request=request,
                 decision=Decision.DENY,
@@ -197,13 +207,19 @@ class Gate:
                 error=StructuredError(
                     code="repeat_limit",
                     message=(
-                        f"相同动作已出现 {repeat_count} 次，"
-                        f"达到上限 {self.policy.repeat_limit}；请更换参数或调整计划"
+                        f"相同动作已执行/被拒 {repeat_count} 次，"
+                        f"达到 {spec.risk.value} 类上限 {repeat_limit}（审批挂起不计入）；请更换参数或调整计划"
                     ),
                     tool=request.tool_name,
                     tool_call_id=request.tool_call_id,
                     rule="repeat_limit",
-                    detail={"signature": request.signature},
+                    detail={
+                        "signature": request.signature,
+                        "risk": spec.risk.value,
+                        "limit": repeat_limit,
+                        "attempts": repeat_count,
+                        "pending_count": self.state.ledger_pending_count(request.signature),
+                    },
                 ),
             )
 
@@ -224,6 +240,29 @@ class Gate:
                     decision=Decision.ALLOW,
                     rule="approval_granted",
                     detail={"approval": approval},
+                )
+            pending_count = self.state.ledger_pending_count(request.signature)
+            pending_limit = int(getattr(self.policy, "pending_retry_limit", 3))
+            if pending_count >= pending_limit:
+                return GateVerdict(
+                    request=request,
+                    decision=Decision.DENY,
+                    rule="pending_retry_limit",
+                    error=StructuredError(
+                        code="pending_retry_limit",
+                        message=(
+                            f"同一写入已挂起审批 {pending_count} 次，达到上限 {pending_limit}；"
+                            "请调整方案或联系人工处理"
+                        ),
+                        tool=request.tool_name,
+                        tool_call_id=request.tool_call_id,
+                        rule="pending_retry_limit",
+                        detail={
+                            "signature": request.signature,
+                            "pending_count": pending_count,
+                            "limit": pending_limit,
+                        },
+                    ),
                 )
             return GateVerdict(
                 request=request,
@@ -276,13 +315,13 @@ class Gate:
     def evaluate_batch(self, requests: list[ActionRequest], step: int) -> list[GateVerdict]:
         verdicts: list[GateVerdict] = []
         batch = _BatchAccounting()
+        self._decisions.clear()
         for request in requests:
             request.step = int(step)
             verdict = self.evaluate(request, batch=batch)
             verdicts.append(verdict)
             # 同批后续请求必须看得到本请求已占用的次数与已写入标记。
             batch.counts[request.signature] = batch.count(request.signature) + 1
-            self._decisions[request.signature] = verdict.decision
             self.audit.append(
                 "gate.decision",
                 self.state.run_id,
@@ -313,8 +352,14 @@ class Gate:
             # tool_calls 入口即计（拒绝也计）。
             self.state.charge("tool_calls", 1)
             # 整批无法执行时，ALLOW 项既没落盘也没跑测，不能记台账、扣写预算或消耗审批。
-            if charge_side_effects or verdict.decision != Decision.ALLOW:
+            if verdict.decision == Decision.REQUIRE_APPROVAL:
+                self.state.ledger_record(request.signature, request.tool_call_id, attempt=False, pending=True)
+            elif verdict.decision == Decision.DENY:
                 self.state.ledger_record(request.signature, request.tool_call_id)
+            elif charge_side_effects:
+                self.state.ledger_record(request.signature, request.tool_call_id)
+            else:
+                self.state.ledger_record(request.signature, request.tool_call_id, attempt=False)
             if verdict.decision == Decision.ALLOW:
                 if not charge_side_effects:
                     continue

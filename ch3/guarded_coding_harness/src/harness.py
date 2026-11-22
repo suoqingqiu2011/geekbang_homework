@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -77,11 +78,19 @@ class HarnessPolicy:
     max_test_runs: int = 8
     max_seconds: float = 180.0
     repeat_limit: int = 2
+    repeat_limit_read: int = 6
+    repeat_limit_control: int = 8
+    pending_retry_limit: int = 3
     command_timeout: float = 30.0
     approval_ttl_steps: int = 3
     writable_zones: tuple[str, ...] = ("artifacts", "src")
     require_write_approval: bool = True
     suites: dict[str, list[str]] = field(default_factory=lambda: {k: list(v) for k, v in DEFAULT_SUITES.items()})
+
+    def __post_init__(self) -> None:
+        for name in ("repeat_limit", "repeat_limit_read", "repeat_limit_control", "pending_retry_limit"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} 必须大于 0")
 
     def limits(self) -> BudgetLimits:
         return BudgetLimits(
@@ -91,6 +100,13 @@ class HarnessPolicy:
             max_test_runs=self.max_test_runs,
             max_seconds=self.max_seconds,
         )
+
+    def repeat_limit_for(self, risk: RiskClass) -> int:
+        if risk == RiskClass.WRITE:
+            return int(self.repeat_limit)
+        if risk == RiskClass.CONTROL:
+            return int(self.repeat_limit_control)
+        return int(self.repeat_limit_read)
 
     def suite_command(self, scope: str) -> list[str]:
         if scope not in self.suites:
@@ -191,6 +207,8 @@ class ToolRuntime:
 
     # -- 调用登记 -----------------------------------------------------------
     def register_calls(self, requests: list[ActionRequest]) -> None:
+        self._calls.clear()
+        self._last_calls_by_tool.clear()
         for request in requests:
             self._calls[request.signature] = request.tool_call_id
             self._last_calls_by_tool[request.tool_name] = request.tool_call_id
@@ -207,6 +225,25 @@ class ToolRuntime:
         handler = getattr(self, f"_do_{tool_name}", None)
         if handler is None:
             raise ValueError(f"未知工具：{tool_name}")
+        try:
+            signature = call_signature(tool_name, arguments)
+        except ValueError:
+            signature = ""
+        decision = self.harness.gate.decision_for(signature) if signature else None
+        if decision is not Decision.ALLOW:
+            self.audit.append(
+                "tool.invoke_denied",
+                self.state.run_id,
+                tool_call_id=tool_call_id or None,
+                actor="harness",
+                decision="deny",
+                rule="gate_not_allow",
+                detail={"tool": tool_name, "signature": signature, "step": int(step)},
+            )
+            raise PolicyDenied(
+                f"工具 {tool_name} 未获得 Gate 放行（signature={signature or '无法计算'}）；"
+                "工具只能经 agent.run 的 Gate 批次执行"
+            )
         self.current_step = int(step)
         return handler(arguments, tool_call_id or self.call_id_for(tool_name, arguments))
 
@@ -697,6 +734,15 @@ def _pre_write(request: ActionRequest, sandbox: Sandbox) -> None:
     request.context["target"] = os.path.relpath(str(target), str(sandbox.root)).replace(os.sep, "/")
 
 
+def _forward_defaults(tool_cls: type[Tool]) -> dict[str, Any]:
+    params = inspect.signature(tool_cls.forward).parameters
+    return {
+        name: param.default
+        for name, param in params.items()
+        if name != "self" and param.default is not inspect.Parameter.empty
+    }
+
+
 def build_specs(policy: HarnessPolicy, sandbox: Sandbox) -> dict[str, ToolSpec]:
     allowed_scopes = set(policy.suites)
 
@@ -725,11 +771,14 @@ def build_specs(policy: HarnessPolicy, sandbox: Sandbox) -> dict[str, ToolSpec]:
 
     return {
         "list_files": ToolSpec("list_files", RiskClass.READ, optional=("path", "max_entries"),
-                               types={"path": str, "max_entries": int}, pre_check=_pre_read),
+                               types={"path": str, "max_entries": int},
+                               defaults=_forward_defaults(ListFilesTool), pre_check=_pre_read),
         "search_code": ToolSpec("search_code", RiskClass.READ, required=("pattern",), optional=("path",),
-                                types={"pattern": str, "path": str}, pre_check=_pre_read),
+                                types={"pattern": str, "path": str},
+                                defaults=_forward_defaults(SearchCodeTool), pre_check=_pre_read),
         "read_file": ToolSpec("read_file", RiskClass.READ, required=("path",), optional=("start_line", "max_lines"),
-                              types={"path": str, "start_line": int, "max_lines": int}, pre_check=_pre_read),
+                              types={"path": str, "start_line": int, "max_lines": int},
+                              defaults=_forward_defaults(ReadFileTool), pre_check=_pre_read),
         "inspect_workspace": ToolSpec("inspect_workspace", RiskClass.READ),
         "write_file": ToolSpec("write_file", RiskClass.WRITE, required=("path", "content"),
                                types={"path": str, "content": str}, pre_check=_pre_write),
@@ -741,6 +790,7 @@ def build_specs(policy: HarnessPolicy, sandbox: Sandbox) -> dict[str, ToolSpec]:
                                     optional=("kind", "ok"),
                                     types={"scope": str, "summary": str, "kind": str, "ok": bool},
                                     choices={"kind": set(AUXILIARY_EVIDENCE_KINDS)},
+                                    defaults=_forward_defaults(RecordEvidenceTool),
                                     pre_check=_pre_evidence),
         "update_plan": ToolSpec("update_plan", RiskClass.CONTROL, required=("items",), types={"items": list},
                                 pre_check=_pre_plan),
@@ -806,8 +856,8 @@ class GuardedToolCallingAgent(ToolCallingAgent):
             )
             return
         requests = [harness.build_request(call, harness.current_step) for call in calls]
-        harness.runtime.register_calls(requests)
         verdicts = harness.gate.evaluate_batch(requests, harness.current_step)
+        harness.runtime.register_calls(requests)
         all_allow = all(verdict.decision == Decision.ALLOW for verdict in verdicts)
         # 只有整批都能执行时才扣写/测试预算、消耗审批；否则整批会在下面中止。
         harness.gate.commit_batch(
@@ -818,6 +868,7 @@ class GuardedToolCallingAgent(ToolCallingAgent):
             if verdict.decision == Decision.REQUIRE_APPROVAL:
                 memory_step.tool_calls = [ToolCall(name=c.function.name, arguments=c.function.arguments, id=c.id) for c in calls]
                 message = verdict.error.message if verdict.error else "写操作需要人工审批"
+                harness.gate.clear_batch()
                 raise ApprovalRequired(message, tool_call_id=request.tool_call_id)
             if verdict.decision == Decision.DENY:
                 memory_step.tool_calls = [ToolCall(name=c.function.name, arguments=c.function.arguments, id=c.id) for c in calls]
@@ -834,6 +885,7 @@ class GuardedToolCallingAgent(ToolCallingAgent):
                         "error": verdict.error.to_dict() if verdict.error else {"code": "denied"},
                     },
                 )
+                harness.gate.clear_batch()
                 if verdict.error and verdict.error.code == "budget_exceeded":
                     raise BudgetExceeded(verdict.error.message)
                 raise AgentToolCallError(
@@ -854,6 +906,8 @@ class GuardedToolCallingAgent(ToolCallingAgent):
                 detail={"message": str(exc), "step": harness.current_step},
             )
             raise
+        finally:
+            harness.gate.clear_batch()
 
 
 class GuardedHarness:
@@ -1014,6 +1068,7 @@ class GuardedHarness:
             self._running = False
             # 会话结束后必须清空：否则非运行态的 cancel() 会拿旧 PID 杀无关进程。
             self.sandbox.last_pid = None
+            self.gate.clear_batch()
 
     def resume(self, *, decisions: dict[str, str] | None = None, task: str | None = None) -> HarnessResult:
         checkpoint = self.checkpoints.latest()
@@ -1097,6 +1152,7 @@ class GuardedHarness:
         finally:
             self._running = False
             self.sandbox.last_pid = None
+            self.gate.clear_batch()
 
     def _execute(self, task: str, *, reset: bool) -> HarnessResult:
         agent = self._ensure_agent()

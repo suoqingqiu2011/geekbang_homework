@@ -305,7 +305,6 @@ def main() -> int:
         max_writes=8,
         max_test_runs=5,
         max_seconds=600,
-        repeat_limit=4,
         approval_ttl_steps=8,
         require_write_approval=True,
         suites={"target": ["tests/test_target.py"]},

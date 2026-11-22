@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from conftest import SAMPLE_SOURCE, SAMPLE_SOURCE_PATCHED, call, make_harness, read
-from contracts import ActionRequest, Decision, call_signature
+from contracts import ActionRequest, Decision, PolicyDenied, call_signature
+from harness import _forward_defaults, build_tools
 
 
 def spy_handler(monkeypatch, runtime, attribute):
@@ -58,7 +59,7 @@ def test_g1_wrong_type_never_calls_handler(workspace, monkeypatch):
 
 def test_g2_third_identical_call_is_blocked_before_handler(workspace, monkeypatch):
     script = [call("read_file", path="src/app.py") for _ in range(3)]
-    harness, _ = make_harness(workspace, script, max_steps=3, repeat_limit=2)
+    harness, _ = make_harness(workspace, script, max_steps=3, repeat_limit_read=2)
     calls = spy_handler(monkeypatch, harness.runtime, "_do_read_file")
     harness.run("重复读取")
     assert len(calls) == 2
@@ -82,6 +83,13 @@ def test_g3_unapproved_write_keeps_file_and_waits(workspace, monkeypatch):
     assert result.stop_reason == "approval_required"
     assert len(result.pending) == 1
     assert result.pending[0]["signature"]
+
+    with pytest.raises(PolicyDenied):
+        harness.runtime.invoke(
+            "write_file",
+            {"path": "src/app.py", "content": SAMPLE_SOURCE_PATCHED},
+        )
+    assert calls == []
 
 
 def test_g4_approved_write_executes_once_then_duplicate_denied(workspace, monkeypatch):
@@ -114,6 +122,110 @@ def test_g4_approved_write_executes_once_then_duplicate_denied(workspace, monkey
     ]
     assert duplicate
     assert duplicate[0]["detail"]["error"]["detail"]["first_result"]
+
+
+def test_batch_audit_attribution_uses_distinct_tool_call_ids(workspace):
+    first = call("write_file", path="src/a.py", content="A=1\n")
+    first.id = "w-a"
+    second = call("write_file", path="src/b.py", content="B=1\n")
+    second.id = "w-b"
+    harness, _ = make_harness(
+        workspace,
+        [[first, second]],
+        require_write_approval=False,
+        max_steps=2,
+    )
+
+    harness.run("两笔写入")
+
+    intents = [item for item in harness.audit.records() if item["event"] == "write.intent"]
+    assert {item["tool_call_id"] for item in intents} == {"w-a", "w-b"}
+    assert read(workspace / "src/a.py") == "A=1\n"
+    assert read(workspace / "src/b.py") == "B=1\n"
+
+
+def test_write_pending_retries_do_not_consume_repeat_limit(workspace):
+    harness, _ = make_harness(
+        workspace,
+        [],
+        require_write_approval=True,
+        repeat_limit=2,
+        approval_ttl_steps=1,
+        pending_retry_limit=3,
+    )
+
+    def write_request(call_id: str, step: int) -> ActionRequest:
+        return ActionRequest(
+            tool_call_id=call_id,
+            tool_name="write_file",
+            arguments={"path": "src/app.py", "content": SAMPLE_SOURCE_PATCHED},
+            step=step,
+        )
+
+    first = write_request("w1", 1)
+    verdict = harness.gate.evaluate_batch([first], 1)[0]
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+    harness.gate.commit_batch([first], [verdict], 1)
+    assert harness.state.ledger_attempts(first.signature) == 0
+    assert harness.state.ledger_pending_count(first.signature) == 1
+
+    pending = harness.state.pending_items()[0]
+    harness.approve(pending["tool_call_id"], actor="reviewer", reason="ok", ttl_steps=0)
+
+    second = write_request("w2", 5)
+    verdict = harness.gate.evaluate_batch([second], 5)[0]
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+    harness.gate.commit_batch([second], [verdict], 5)
+    assert harness.state.ledger_attempts(second.signature) == 0
+    assert harness.state.ledger_pending_count(second.signature) == 2
+    assert len(harness.state.pending_items()) == 1
+    assert harness.state.pending_items()[0]["tool_call_id"] == "w2"
+
+    pending = harness.state.pending_items()[0]
+    harness.approve(pending["tool_call_id"], actor="reviewer", reason="ok", ttl_steps=5)
+
+    third = write_request("w3", 5)
+    verdict = harness.gate.evaluate_batch([third], 5)[0]
+    assert verdict.decision is Decision.ALLOW
+    assert verdict.rule == "approval_granted"
+    harness.gate.commit_batch([third], [verdict], 5)
+    assert harness.state.ledger_attempts(third.signature) == 1
+
+
+def test_pending_retry_limit_blocks_repeated_approval_requests(workspace):
+    harness, _ = make_harness(
+        workspace,
+        [],
+        require_write_approval=True,
+        pending_retry_limit=2,
+        repeat_limit=2,
+    )
+
+    def write_request(call_id: str, step: int) -> ActionRequest:
+        return ActionRequest(
+            tool_call_id=call_id,
+            tool_name="write_file",
+            arguments={"path": "src/app.py", "content": SAMPLE_SOURCE_PATCHED},
+            step=step,
+        )
+
+    first = write_request("w1", 1)
+    verdict = harness.gate.evaluate_batch([first], 1)[0]
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+    harness.gate.commit_batch([first], [verdict], 1)
+
+    second = write_request("w2", 2)
+    verdict = harness.gate.evaluate_batch([second], 2)[0]
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+    harness.gate.commit_batch([second], [verdict], 2)
+    assert len(harness.state.pending_items()) == 1
+    assert harness.state.ledger_pending_count(first.signature) == 2
+
+    third = write_request("w3", 3)
+    verdict = harness.gate.evaluate_batch([third], 3)[0]
+    assert verdict.decision is Decision.DENY
+    assert verdict.rule == "pending_retry_limit"
+    assert verdict.error.code == "pending_retry_limit"
 
 
 def test_gate_duplicate_applied_includes_first_receipt(workspace):
@@ -220,7 +332,7 @@ def test_batch_budget_denial_aborts_before_any_write(workspace):
 
 def test_batch_repeat_limit_counts_same_read_in_one_batch(workspace):
     """repeat_limit 必须把同批已评估请求计入，不能靠 commit 后的台账。"""
-    harness, _ = make_harness(workspace, [], repeat_limit=1)
+    harness, _ = make_harness(workspace, [], repeat_limit_read=1)
     requests = [
         ActionRequest(tool_call_id="c1", tool_name="read_file", arguments={"path": "src/app.py"}, step=1),
         ActionRequest(tool_call_id="c2", tool_name="read_file", arguments={"path": "src/app.py"}, step=1),
@@ -229,4 +341,38 @@ def test_batch_repeat_limit_counts_same_read_in_one_batch(workspace):
     assert verdicts[0].decision == Decision.ALLOW
     assert verdicts[1].decision == Decision.DENY
     assert verdicts[1].rule == "repeat_limit"
+
+
+def test_all_tool_specs_round_trip_with_forward_defaults(workspace):
+    harness, _ = make_harness(workspace, [], require_write_approval=False)
+    tools = {tool.name: tool for tool in build_tools(harness.runtime)}
+    cases = {
+        "list_files": {},
+        "search_code": {"pattern": "def add"},
+        "read_file": {"path": "src/app.py"},
+        "inspect_workspace": {},
+        "write_file": {"path": "src/app.py", "content": "x"},
+        "apply_patch": {"path": "src/app.py", "old_text": "return a - b", "new_text": "return a + b"},
+        "run_test": {"scope": "target"},
+        "record_evidence": {"scope": "target", "summary": "ok"},
+        "update_plan": {"items": ["inspect", "fix"]},
+        "final_answer": {"answer": "done"},
+    }
+    assert set(cases) == set(harness.gate.specs) == set(tools)
+
+    for name, raw_arguments in cases.items():
+        tool = tools[name]
+        spec = harness.gate.specs[name]
+        forward_defaults = _forward_defaults(type(tool))
+        assert spec.defaults == forward_defaults, name
+
+        request = ActionRequest(
+            tool_call_id=f"sig-{name}",
+            tool_name=name,
+            arguments=dict(raw_arguments),
+            step=1,
+        )
+        verdict = harness.gate.evaluate_batch([request], 1)[0]
+        assert verdict.decision is Decision.ALLOW, (name, verdict.error)
+        assert request.signature == call_signature(name, {**raw_arguments, **forward_defaults}), name
 

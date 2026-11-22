@@ -10,6 +10,7 @@ import time
 import pytest
 
 from conftest import make_harness
+from contracts import ActionRequest, Decision
 from sandbox import (
     CommandResult,
     Sandbox,
@@ -17,6 +18,15 @@ from sandbox import (
     is_process_alive,
     workspace_fingerprint,
 )
+
+
+def invoke_authorized(harness, tool_name: str, arguments: dict) -> str:
+    request = ActionRequest(tool_call_id=f"test-{tool_name}", tool_name=tool_name, arguments=dict(arguments), step=1)
+    harness.runtime.register_calls([request])
+    verdict = harness.gate.evaluate_batch([request], 1)[0]
+    assert verdict.decision is Decision.ALLOW, verdict.error
+    harness.gate.commit_batch([request], [verdict], 1)
+    return harness.runtime.invoke(tool_name, dict(request.arguments), tool_call_id=request.tool_call_id)
 
 
 def test_s1_dotdot_escape_and_sensitive_targets_are_rejected(workspace):
@@ -108,15 +118,15 @@ def test_walk_based_read_tools_do_not_expose_sensitive_files(workspace):
     (workspace / "id_rsa").write_text("PRIVATE-KEY-MATERIAL\n", encoding="utf-8")
     harness, _ = make_harness(workspace, [])
 
-    listing = harness.runtime.invoke("list_files", {"path": "."})
+    listing = invoke_authorized(harness, "list_files", {"path": "."})
     assert ".env" not in listing
     assert "id_rsa" not in listing
 
-    leaked = harness.runtime.invoke("search_code", {"pattern": "PRIVATE-KEY-MATERIAL", "path": "."})
+    leaked = invoke_authorized(harness, "search_code", {"pattern": "PRIVATE-KEY-MATERIAL", "path": "."})
     assert "PRIVATE-KEY-MATERIAL" not in leaked
     assert "leak-me" not in leaked
 
-    normal = harness.runtime.invoke("search_code", {"pattern": "return a - b", "path": "src"})
+    normal = invoke_authorized(harness, "search_code", {"pattern": "return a - b", "path": "src"})
     assert "src/app.py" in normal
 
 
@@ -136,9 +146,9 @@ def test_walk_based_read_tools_skip_link_escape(workspace, tmp_path):
         pytest.skip("当前环境不支持创建链接逃逸场景")
 
     harness, _ = make_harness(workspace, [])
-    found = harness.runtime.invoke("search_code", {"pattern": "ESCAPED-SECRET", "path": "."})
+    found = invoke_authorized(harness, "search_code", {"pattern": "ESCAPED-SECRET", "path": "."})
     assert "ESCAPED-SECRET" not in found
-    listing = harness.runtime.invoke("list_files", {"path": "artifacts"})
+    listing = invoke_authorized(harness, "list_files", {"path": "artifacts"})
     assert "linked/secret.txt" not in listing
 
 

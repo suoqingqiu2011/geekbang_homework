@@ -197,11 +197,17 @@ class StateStore:
     def ledger_entry(self, signature: str) -> dict[str, Any]:
         return self.data["ledger"].setdefault(
             signature,
-            {"count": 0, "tool_call_ids": [], "applied": False, "result": None},
+            {"count": 0, "attempts": 0, "pending_count": 0, "tool_call_ids": [], "applied": False, "result": None},
         )
 
     def ledger_count(self, signature: str) -> int:
         return int(self.ledger_entry(signature).get("count", 0))
+
+    def ledger_attempts(self, signature: str) -> int:
+        return int(self.ledger_entry(signature).get("attempts", 0))
+
+    def ledger_pending_count(self, signature: str) -> int:
+        return int(self.ledger_entry(signature).get("pending_count", 0))
 
     def ledger_applied(self, signature: str) -> bool:
         return bool(self.ledger_entry(signature).get("applied", False))
@@ -209,9 +215,22 @@ class StateStore:
     def ledger_result(self, signature: str) -> Any:
         return self.ledger_entry(signature).get("result")
 
-    def ledger_record(self, signature: str, tool_call_id: str, *, applied: bool = False, result: Any = None) -> None:
+    def ledger_record(
+        self,
+        signature: str,
+        tool_call_id: str,
+        *,
+        applied: bool = False,
+        result: Any = None,
+        attempt: bool = True,
+        pending: bool = False,
+    ) -> None:
         entry = self.ledger_entry(signature)
         entry["count"] = int(entry.get("count", 0)) + 1
+        if attempt:
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        if pending:
+            entry["pending_count"] = int(entry.get("pending_count", 0)) + 1
         if tool_call_id and tool_call_id not in entry["tool_call_ids"]:
             entry["tool_call_ids"].append(tool_call_id)
         if applied:
@@ -241,6 +260,9 @@ class StateStore:
         step: int,
         target: str = "",
     ) -> dict[str, Any]:
+        for key, item in list(self.data["pending"].items()):
+            if item.get("signature") == signature:
+                self.data["pending"].pop(key, None)
         record = {
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,

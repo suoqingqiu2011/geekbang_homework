@@ -1,6 +1,6 @@
 # Guarded Coding Harness
 
-基于 [smolagents](https://github.com/huggingface/smolagents) `ToolCallingAgent` 的受控编码执行框架。它不改写内核，只覆写 `process_tool_calls` 一处拦截缝，在工具真正执行前完成参数校验、权限与路径约束、风险分级、写审批、重复调用拦截、预算控制，并把每一步的决策、写入、测试证据、Checkpoint 和审计链落盘。
+基于 [smolagents](https://github.com/huggingface/smolagents) `ToolCallingAgent` 的受控编码执行框架。它不改写内核，在 `process_tool_calls` 拦截缝完成参数校验、权限与路径约束、风险分级、写审批、重复调用拦截、预算控制；`ToolRuntime.invoke` 作为唯一受支持的工具执行入口，会复核 Gate 在本批次签发的 `ALLOW` 决策，绕过 `agent.run` 直接调用工具会被拒绝。每一步的决策、写入、测试证据、Checkpoint 和审计链都会落盘。
 
 完成契约只认真实测试证据（`kind` 为 `test` / `test_run`，且 `returncode == 0`、指纹与当前工区一致）；`note`、`finding`、`check` 等自报记录不能作为交付物。
 
@@ -142,7 +142,7 @@ python -m pytest --collect-only
 
 - `sys.executable` 指向 `.../guarded_coding_harness/.venv/Scripts/python.exe`；
 - `smolagents.__file__` 指向 `.../ch3/smolagents/src/smolagents/__init__.py`（本地 editable 源码，而非 `site-packages`）；
-- `pytest --collect-only` 显示 `74 tests collected`。
+- `pytest --collect-only` 显示 `78 tests collected`。
 
 ---
 
@@ -364,6 +364,17 @@ print(result.to_dict())
 
 预算与重复规则在**批次内**也会提前预占：同一批次里第二个同签名写入会被 `duplicate_write` 拒绝，`max_writes` / `max_test_runs` / `repeat_limit` 都把同批已评估请求计入；任一请求被拒时整批中止，不做部分执行（详见 4.7 末尾）。
 
+重复上限按风险分级，且只统计终态执行尝试（`ALLOW` 实际执行 / `DENY`）；`REQUIRE_APPROVAL` 不计入，审批挂起重试由 `pending_retry_limit` 单独约束：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `repeat_limit` | 2 | 写操作终态尝试上限 |
+| `repeat_limit_read` | 6 | 读操作终态尝试上限 |
+| `repeat_limit_control` | 8 | 控制类终态尝试上限 |
+| `pending_retry_limit` | 3 | 同一写入累计审批挂起上限 |
+
+> 这些上限按 **run 累计**，不是滑动窗口：`repeat_limit` 会把被拒绝的尝试继续计入；`pending_count` 在写入成功或 reconcile-release 后不会自动复位，需要重新计数时请新建 run 或更换参数签名。
+
 ### 4.3 审批与恢复
 
 ```python
@@ -375,7 +386,8 @@ if first.status == "waiting_approval":
 ```
 
 - `approve()` 会把审批绑定到「调用签名 + 当前工区指纹 + 步骤」，工区变化后旧审批自动失效（`WorkspaceChanged`）。
-- `reject()` 直接拒绝待审批项，并在所有待审批项都处理完后解除 `blocked`；随后可 `resume()` 让模型换方案继续（重复提交同一动作仍受 `repeat_limit` 约束）。
+- `reject()` 直接拒绝待审批项，并在所有待审批项都处理完后解除 `blocked`；随后可 `resume()` 让模型换方案继续（重复提交同一动作仍受 `repeat_limit` 与 `pending_retry_limit` 约束，审批挂起本身不计入 `repeat_limit`）。
+- 同一写入反复提交会按签名 upsert `pending`，只保留最新一条；`pending_retry_limit` 限制累计挂起次数，超过后 Gate 返回 `DENY / pending_retry_limit`。
 - `resume()` 先取当前 run 的最新 Checkpoint 并把快照恢复进 `StateStore`；`load()` 失败（checksum 不符或文件半截）等同于「没有可恢复快照」。随后按固定优先级执行 `plan_resume()`：终态 → 未确认进程 → 未销记测试意图 → 指纹变化 → `blocked`（仅 `approval_required` 可凭有效批准票放行）→ 未决写入（转 `reconcile`）→ 预算耗尽。命中即停，不会跳过前序检查。
 - 判定为 `refuse` 时：`workspace_changed` / `unknown_result` 落到 `waiting_reconcile`，其余落到 `paused`；同时落一份 `*-resume-refused.json` 快照并抛出对应异常（`WorkspaceChanged` / `UnknownResult` / `BudgetExceeded` / `HarnessCancelled` / `PolicyDenied`）。`workspace_changed` 还会写回 `blocked`，防止二次 `resume()` 洗白。
 
@@ -440,6 +452,10 @@ harness.checker.check()     # -> (bool, message)
 所有 READ/WRITE 路径都经过 `Sandbox.resolve()`：拒绝 `..` 逃逸、软链接逃逸、敏感目录（`.ssh`、`.aws`、`.gnupg`、`.docker`、`.kube`）、敏感文件名与后缀（`id_rsa`、`.pem`、`.key`、`.env*` 等）。`search_code` 与 `list_files` 对遍历发现的每个文件也逐个复检，敏感文件与链接逃逸不会进入模型上下文。
 
 同一批次的请求在 `commit` 前先做**批次内预占**：重复签名、写入次数、测试次数与工具调用预算都会把同批已评估的请求计入。因此「一张审批票 + 同批两条相同写入」不会执行两次，`max_writes=1` 也不会被同批两条写入突破——任一请求被拒即整批中止，不做部分执行。
+
+所有受支持的工具执行都会经过 `ToolRuntime.invoke`：它用 `call_signature(tool, arguments)` 查询 Gate 在本批次登记的决策，只有 `ALLOW` 才执行；决策缺失、`DENY`、`REQUIRE_APPROVAL` 或旧批次残留都会抛 `PolicyDenied`，并写 `tool.invoke_denied` 审计。因此 `agent.run` 是唯一受支持的入口，绕过它直接调用工具实例也无法跳过参数校验、沙箱与审批；私有 `_do_*` 方法不属于受支持入口。
+
+已知边界：同一批次内参数完全相同的重复调用共享一个签名，审计只能稳定归属到该签名的调用集合；如需逐调用严格区分，需要把 `_calls` 升级为按签名队列（当前 `max_tool_threads=1`，工具按顺序执行）。
 
 ---
 
@@ -923,7 +939,7 @@ hash = "h:" + sha256(prev_hash + canonical_json(body))
 | 完成前必有测试证据 | seq 19（`test.result`）在 seq 23（`run.halt/completed`）之前 |
 | 停机可恢复且留痕 | seq 8 `run.halt` → seq 10 `resume.plan` → seq 11 `run.start(rule=resume)` |
 
-本 run 未出现（说明未被触发，而非缺失）的事件：`DENY`、`duplicate_write`、`repeat_limit`、`budget_exceeded`、`workspace_changed`、`unknown_result`。
+本 run 未出现（说明未被触发，而非缺失）的事件：`DENY`、`duplicate_write`、`repeat_limit`、`pending_retry_limit`、`tool.invoke_denied`、`budget_exceeded`、`workspace_changed`、`unknown_result`。
 
 复核脚本：
 
@@ -1146,11 +1162,11 @@ print(plan_resume(approval["snapshot"],
 
 ### 6.1 测试文件与覆盖范围
 
-共 74 个用例（74 passed）。
+共 78 个用例（78 passed）。
 
 | 文件 | 用例数 | 覆盖内容 |
 |---|---|---|
-| `tests/test_gate.py` | 13 | G1 参数校验、G2 重复调用、G3 未审批写入、G4 审批后只执行一次、S1 Gate 级越界、伪造 `test` 证据、批次内同签名写入/预算预占/整批中止/repeat_limit |
+| `tests/test_gate.py` | 17 | G1 参数校验、G2 重复调用、G3 未审批写入、G4 审批后只执行一次、S1 Gate 级越界、伪造 `test` 证据、批次内同签名写入/预算预占/整批中止/repeat_limit、审批挂起不消耗 repeat_limit、pending_retry_limit、批次审计归属、全工具签名往返 |
 | `tests/test_sandbox.py` | 11 | S1 路径逃逸/敏感目标、S2 写区与前缀仿冒/链接逃逸（Windows 用 junction，免管理员）、S3 命令白名单/元字符/CWD、S4 超时与取消杀进程树、指纹排除运行时产物、遍历型读取的敏感文件与链接逃逸过滤、仅跳过根级 `artifacts` |
 | `tests/test_state_checkpoint.py` | 14 | 三态分类、快照原子往返与篡改、`plan_resume` 优先级、台账释放、`begin_session` 拒绝未决意图、`abandon_tests` 销记后恢复、按 run 隔离、新进程 resume |
 | `tests/test_audit.py` | 5 | A1 被拒调用可追溯、A2 事件序列与哈希链、`step.error`、篡改检测、尾部截断/清空检测 |
@@ -1246,14 +1262,14 @@ tests/test_gate.py::test_g1_unknown_argument_is_denied PASSED          [  1%]
 ...
 tests/test_completion.py::test_h2_... PASSED                          [100%]
 
-============================= 74 passed in ~9s =============================
+============================= 78 passed in ~9s =============================
 ```
 
 圆点模式（用 `python -m pytest -q`，`-q` 会抵消 `addopts` 里的 `-v`）：
 
 ```text
 ...................................................................      [100%]
-74 passed in 9.15s
+78 passed in 9.73s
 ```
 
 | 符号 | 含义 |
@@ -1265,7 +1281,7 @@ tests/test_completion.py::test_h2_... PASSED                          [100%]
 
 > 再追加一次 `-q`（即 `-qq`）会隐藏 `====` 装饰与 warnings 摘要，仅保留进度点和单行 `N passed`。
 
-- 链接逃逸用例 `test_s2_symlink_escape_is_rejected_when_supported` 在 Windows 上改用 junction（`_winapi.CreateJunction`，无需管理员），会实际执行而非 `skip`；当前 74 个用例全部通过。
+- 链接逃逸用例 `test_s2_symlink_escape_is_rejected_when_supported` 在 Windows 上改用 junction（`_winapi.CreateJunction`，无需管理员），会实际执行而非 `skip`；当前 78 个用例全部通过。
 - 失败时先看 `-vv --tb=short` 的断言差异；涉及子进程的用例（`test_c3_resume_in_new_process_skips_completed_writes`、`test_s4_*`）失败时，检查 `conftest.child_env()` 拼出的 `PYTHONPATH` 是否包含 `src`、`../smolagents/src`、工区与 `tests`。
 - 时间敏感用例（超时/取消）偶发失败可单独重跑确认：
 
@@ -1344,7 +1360,6 @@ def test_write_requires_approval_then_completes(workspace):
         required_scopes=("target",),
         require_write_approval=True,
         max_steps=6,
-        repeat_limit=3,
     )
 
     first = harness.run("修复 add")
@@ -1373,7 +1388,7 @@ def test_write_requires_approval_then_completes(workspace):
 1. **断言要看结果，不要只看状态**：除 `result.status` 外，同时断言文件内容、`state.latest_evidence()`、`audit.records()` 或 `checker.check()`。
 2. **写操作用 `require_write_approval=False`** 可跳过审批专注测试其他行为；要测审批链路时保持默认 `True`。
 3. **预算相关用例**显式设置 `max_steps` / `max_tool_calls` / `max_test_runs`，避免默认值掩盖问题。
-4. **重复调用**受 `repeat_limit` 控制，构造连续同参调用时显式设置该值。
+4. **重复调用**按风险分级：`repeat_limit`（写）、`repeat_limit_read`（读）、`repeat_limit_control`（控制类），另有 `pending_retry_limit` 约束审批挂起重试；`repeat_limit` 只统计终态执行尝试（ALLOW 实际执行 / DENY），构造连续同参调用时显式设置对应值。
 5. **需要子进程的用例**用 `conftest.child_env(workspace)` 提供环境，避免路径解析失败。
 6. **需要真实重启验证**（如 C3）参照 `test_state_checkpoint.py` 中的 `CHILD_RESUME_SCRIPT` 模式。
 
